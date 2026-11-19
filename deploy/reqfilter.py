@@ -3,15 +3,19 @@
 External traffic reaches this proxy first and is forwarded to the engine on 127.0.0.1.
 - Only inference endpoints pass (allow-list); cache rebuild, /generate, admin and stats routes get 403.
 - Request bodies must be JSON objects; debug fields (ignore_eos) are removed.
-- Streaming responses are passed through; when the client disconnects the upstream connection is
-  closed and the engine aborts the generation.
+- Generation requests with empty input get 400 "input tokens must be > 0".
+- Non-streaming generation requests whose prompt is shorter than nonstream_min_chars characters get
+  400 "backend doesn't support non-stream".
+- Streaming responses are passed through. When the client disconnects, the upstream connection is
+  kept for disconnect_grace_s seconds, then closed, and the engine aborts the generation (a
+  disconnect is also noticed while a non-streaming request is still waiting for its response).
+Thresholds live in rules.json (REQFILTER_RULES); edits apply to the next request, no restart.
 """
-import json, logging, os, re
+import asyncio, json, logging, os, re
 import httpx, uvicorn
 from starlette.applications import Starlette
-from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 UPSTREAM = os.environ.get("REQFILTER_UPSTREAM", "http://127.0.0.1:1920")
@@ -31,6 +35,55 @@ STRIP_FIELDS = ("ignore_eos",)
 HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "upgrade",
        "proxy-connection", "proxy-authorization"}
 log = logging.getLogger("reqfilter")
+RULES_FILE = os.environ.get("REQFILTER_RULES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.json"))
+RULES_DEFAULT = {"nonstream_min_chars": 1000, "disconnect_grace_s": 15}
+_rules = {"key": None, "val": dict(RULES_DEFAULT)}
+GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
+PROMPT_FIELDS = ("messages", "prompt", "input", "system", "instructions", "tools")
+NONSTREAM_MSG = "backend doesn't support non-stream"
+
+
+def rules() -> dict:
+    """rules.json, re-read when its mtime/size changes; a bad file keeps the last good values."""
+    try:
+        st = os.stat(RULES_FILE)
+        key = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        key = None
+    if key != _rules["key"]:
+        _rules["key"] = key
+        val = dict(RULES_DEFAULT)
+        if key is not None:
+            try:
+                doc = json.load(open(RULES_FILE))
+                for k in ("nonstream_min_chars", "disconnect_grace_s"):
+                    n = doc.get(k, val[k])
+                    if not isinstance(n, (int, float)) or isinstance(n, bool) or n < 0:
+                        raise ValueError(f"{k} must be a number >= 0, got {n!r}")
+                    val[k] = n
+            except Exception as e:  # noqa: BLE001
+                log.error("rules.json rejected, keeping last values: %s: %s", type(e).__name__, e)
+                return _rules["val"]
+        _rules["val"] = val
+        log.info("rules: %s", val)
+    return _rules["val"]
+
+
+def _chars(x) -> int:
+    if isinstance(x, str):
+        return len(x)
+    if isinstance(x, dict):
+        return sum(_chars(v) for k, v in x.items() if k not in ("role", "type"))
+    if isinstance(x, list):
+        return sum(_chars(v) for v in x)
+    return 0
+
+
+def prompt_chars(doc: dict, fields=PROMPT_FIELDS) -> int:
+    return sum(_chars(doc.get(f)) for f in fields)
+
+
+INPUT_FIELDS = ("messages", "prompt", "input", "system", "instructions")   # tool schemas are not input
 client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
                            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16))
 
@@ -59,22 +112,131 @@ async def handle(request: Request):
                 return deny(request, 400, "request body must be a JSON object")
             for f in STRIP_FIELDS:
                 doc.pop(f, None)
+            if path in GEN_PATHS and prompt_chars(doc, INPUT_FIELDS) == 0:
+                log.warning("BLOCK 400 empty input %s from %s (xff=%s)", path,
+                            request.client.host if request.client else "?",
+                            request.headers.get("x-forwarded-for", "-"))
+                msg = "input tokens must be > 0"
+                if path == "/v1/messages":
+                    return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": msg}},
+                                        status_code=400)
+                return JSONResponse({"error": {"type": "invalid_request_error", "code": "empty_input", "message": msg}},
+                                    status_code=400)
+            if path in GEN_PATHS and doc.get("stream") is not True:
+                n = prompt_chars(doc)
+                if n < rules()["nonstream_min_chars"]:
+                    log.warning("BLOCK 400 non-stream %s (%d prompt chars) from %s (xff=%s)", path, n,
+                                request.client.host if request.client else "?",
+                                request.headers.get("x-forwarded-for", "-"))
+                    if path == "/v1/messages":
+                        err = {"type": "error", "error": {"type": "invalid_request_error", "message": NONSTREAM_MSG}}
+                    else:
+                        err = {"error": {"type": "invalid_request_error", "code": "stream_required",
+                                         "message": NONSTREAM_MSG}}
+                    return JSONResponse(err, status_code=400)
             body = json.dumps(doc, ensure_ascii=False).encode()
     headers = [(k, v) for k, v in request.headers.items() if k.lower() not in HOP]
     if body:
         headers = [(k, v) for k, v in headers if k.lower() != "content-type"] + [("content-type", "application/json")]
-    req = client.build_request(method, path, params=request.query_params, headers=headers, content=body or None)
+    disc = asyncio.create_task(_wait_disconnect(request))
+    send = asyncio.create_task(_send(method, path, request.query_params, headers, body))
+    await asyncio.wait({send, disc}, return_when=asyncio.FIRST_COMPLETED)
+    if not send.done():
+        # The client left before the response head (e.g. a non-stream request still generating).
+        grace = rules()["disconnect_grace_s"]
+        log.info("client gone before response on %s, keeping upstream %ss", path, grace)
+        await asyncio.wait({send}, timeout=grace)
+        if not send.done():
+            send.cancel()
+            await asyncio.gather(send, return_exceptions=True)
+            log.info("upstream request on %s cancelled (client gone > %ss)", path, grace)
+        elif send.exception() is None:
+            await send.result().aclose()
+        return Response(status_code=499)
     try:
-        up = await client.send(req, stream=True)
+        up = send.result()
     except httpx.HTTPError as e:
+        disc.cancel()
         log.error("upstream error %s %s: %s: %s", method, path, type(e).__name__, e)
         return JSONResponse({"error": {"type": "upstream_unavailable", "message": f"{type(e).__name__}: {e}"}},
                             status_code=502)
     out_headers = {k: v for k, v in up.headers.items() if k.lower() not in HOP and k.lower() != "content-encoding"}
-    return StreamingResponse(up.aiter_raw(), status_code=up.status_code, headers=out_headers,
-                             background=BackgroundTask(up.aclose))
+    return StreamingResponse(relay(up, disc, path), status_code=up.status_code, headers=out_headers)
 
 
+async def _wait_disconnect(request: Request) -> None:
+    """Resolves when the client goes away: the body is already read, so the next ASGI message is
+    http.disconnect. Starlette (ASGI spec >= 2.4) only notices a disconnect when a write fails and
+    then skips the response's background task, so before this a non-stream request (nothing is
+    written until the engine is done) or a dropped stream left the upstream open and the engine
+    generating for nobody."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _send(method, path, params, headers, body):
+    req = client.build_request(method, path, params=params, headers=headers, content=body or None)
+    try:
+        return await client.send(req, stream=True)
+    except httpx.ConnectError as e:
+        if fallback is None:
+            raise
+        log.error("upstream %s unreachable (%s: %s), using %s", UPSTREAM, type(e).__name__, e, FALLBACK)
+        req = fallback.build_request(method, path, params=params, headers=headers, content=body or None)
+        return await fallback.send(req, stream=True)
+
+
+async def relay(up: httpx.Response, disc: asyncio.Task, path: str):
+    """Relay the upstream body in this one task: every read races the disconnect watcher, so a
+    dropped client is seen even while the upstream is silent. After a drop the upstream is kept
+    for disconnect_grace_s, then closed, which aborts the generation."""
+    it = up.aiter_raw()
+    nxt = None
+    finished = False
+    try:
+        while True:
+            nxt = asyncio.ensure_future(it.__anext__())
+            await asyncio.wait({nxt, disc}, return_when=asyncio.FIRST_COMPLETED)
+            if not nxt.done():
+                break                                  # client gone, upstream still producing
+            try:
+                chunk = nxt.result()
+            except StopAsyncIteration:
+                finished = True
+                break
+            except (httpx.StreamClosed, httpx.ReadError, httpx.RemoteProtocolError):
+                break
+            nxt = None
+            yield chunk
+    finally:
+        disc.cancel()
+        if finished:
+            await up.aclose()
+        else:
+            # Starlette may be cancelling this task (client gone), so the hold + close runs detached.
+            t = asyncio.create_task(_close_later(up, nxt, path))
+            _closers.add(t)
+            t.add_done_callback(_closers.discard)
+
+
+_closers: set = set()
+
+
+async def _close_later(up: httpx.Response, nxt, path: str) -> None:
+    grace = rules()["disconnect_grace_s"]
+    log.info("client gone on %s, keeping upstream %ss", path, grace)
+    await asyncio.sleep(grace)
+    if nxt is not None and not nxt.done():
+        nxt.cancel()
+        await asyncio.gather(nxt, return_exceptions=True)
+    await up.aclose()
+    log.info("upstream on %s closed", path)
+
+# Optional second upstream, used when REQFILTER_UPSTREAM refuses the connection (e.g. a proxy in front
+# of the engine is down). Empty = no fallback.
+FALLBACK = os.environ.get("REQFILTER_FALLBACK", "")
+fallback = httpx.AsyncClient(base_url=FALLBACK, timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
+                             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16)) if FALLBACK else None
 app = Starlette(routes=[Route("/{p:path}", handle, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])])
 
 if __name__ == "__main__":

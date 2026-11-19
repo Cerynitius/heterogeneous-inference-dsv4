@@ -292,7 +292,7 @@ class DsparkDraft:
 
     # ---- draft ------------------------------------------------------------------------
     @torch.inference_mode()
-    def draft(self, next_token: torch.Tensor):
+    def draft(self, next_token: torch.Tensor, samp=None):
         """next_token [1] (the just-emitted token, consumed at position ring_last+1).
         Returns (draft_tokens [block] int64, confidence [block] fp32).
 
@@ -305,8 +305,7 @@ class DsparkDraft:
         start = self.ring_last  # reference start_pos: newest ring position
         ids = torch.full((1, B), self.noise_id, dtype=torch.long, device=self.device)
         ids[0, 0] = next_token
-        emb_w = self.model.embed.weight
-        h = emb_w[ids].unsqueeze(2).repeat(1, 1, self.hc.hc_mult, 1)
+        h = self.model.embed(ids).unsqueeze(2).repeat(1, 1, self.hc.hc_mult, 1)
 
         freqs = self._freqs()
         for si, st in enumerate(self.stages):
@@ -321,15 +320,25 @@ class DsparkDraft:
         out[0] = next_token
         m_embeds = []
         logits = logits.float()
+        q = None
+        if samp is not None:   # speculative sampling: d_i ~ q_i, q kept for the accept test
+            from .spec_sample import probs_from_logits
+            q = torch.empty_like(logits)
         for i in range(B):
             me = self.w["markov_w1"][out[i]]               # [rank]
             bias = F.linear(me, self.w["markov_w2"])       # [V]
             logits[i] += bias.float()
             m_embeds.append(me)
-            out[i + 1] = logits[i].argmax()
+            if samp is None:
+                out[i + 1] = logits[i].argmax()
+            else:
+                q[i] = probs_from_logits(logits[i:i + 1], samp)[0]
+                out[i + 1] = torch.multinomial(q[i], 1)[0]
         m_emb = torch.stack(m_embeds, dim=0)               # [B, rank]
         conf_in = torch.cat([x[0].float(), m_emb.float()], dim=-1)
         confidence = F.linear(conf_in, self.w["confidence"]).squeeze(-1)  # [B]
+        if samp is not None:
+            return out[1:], confidence, q
         return out[1:], confidence
 
     def _lm_head(self, x: torch.Tensor) -> torch.Tensor:

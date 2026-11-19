@@ -746,9 +746,9 @@ class CacheManager:
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 update_kv_after_len=old_handle.cached_len)
         self.unlock(old_handle)
-        self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
-        self._free(freed)
         if finished:
+            self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel
+            self._free(freed)
             # Page-unaligned tail (page_size>1) not inserted. The padded slice reaches to the
             # page-ceil bound: allocate_paged charged a swa slot for EVERY token of the last
             # partial page (whole-page alloc_swa), so the padding slots must return with it or
@@ -784,6 +784,18 @@ class CacheManager:
             if keep_from > 0:
                 self.prefix_cache.match_prefix(self._key_ids_of(req)[:keep_from])
             m = self.prefix_cache.match_prefix(self._key_ids_of(req)[:insert_len])
+            # Past the windowed match the row is NOT re-pointed, so the request keeps reading its
+            # own pages there. insert returns them as dups when the span matched a tombstone it
+            # could not revive (another request full-locks it, or it is out of this request's
+            # window): the tree keeps its own copy, this request still needs its pages (full KV,
+            # and live swa for its window). Freeing them here handed live KV to the next
+            # allocation and the finish commit freed them again (2026-11-19: free + cache pages
+            # exceeded the pool by 62). They stay the request's own; a later commit revives the
+            # tombstone with them or frees them once.
+            if m.cached_len < insert_len and freed.numel():
+                freed = self._drop_pages(freed, self.page_table[req.table_idx, m.cached_len:insert_len])
+            self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel
+            self._free(freed)
             # Re-point the page table to the tree's live slots for the committed region. Any dup
             # slots insert reclaimed had their full->swa mapping reset to the 0 sentinel; unlike the
             # full pool (KV survives in place until realloc), a stale swa mapping would make the
@@ -793,6 +805,13 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
+
+    def _drop_pages(self, slots: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+        """``slots`` (whole pages, page-aligned) minus the pages that also appear in ``keep``."""
+        P = self.page_size
+        pages = slots.view(-1, P)
+        mask = ~torch.isin(pages[:, 0], keep[::P])
+        return pages[mask].reshape(-1)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish

@@ -436,6 +436,12 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         dev0 = torch.device("cuda", torch.cuda.current_device())
         dev1 = torch.device("cuda", int(os.environ.get("FREETOKEN_DSV4_EP_DEV1", "1")))
         assert dev0 != dev1, f"EP needs two devices, got {dev0} twice"
+        if os.environ.get("FREETOKEN_DSV4_EMBED_HOST", "0") == "1":
+            # embedding table -> pinned host, zero-copy gather (frees ~1 GiB on dev0, exact)
+            from freetoken.kernel.triton.dsv4.host_embed import HostEmbedding
+
+            self._transformer.embed = HostEmbedding(self._transformer.embed.weight)
+            torch.cuda.empty_cache()
         from .ep_dense import (EPDenseQ, EPDenseWo, calibrate, comp_dev1_bytes, q_dev1_bytes,
                                wo_dev1_bytes, wo_groups_for_dev1)
 

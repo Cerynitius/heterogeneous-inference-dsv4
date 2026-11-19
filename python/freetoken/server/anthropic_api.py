@@ -36,6 +36,7 @@ from .generation import (
     extract_images,
     KEEPALIVE,
     ContentDelta,
+    GenAdmitted,
     GenDone,
     GenerationError,
     GenResult,
@@ -125,7 +126,7 @@ async def handle_anthropic_messages(
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
         events = anthropic_event_stream(
-            generate_events(uid, spec, state, source="/v1/messages"),
+            generate_events(uid, spec, state, source="/v1/messages", emit_admitted=True),
             req.model, uid, cache_report=cache_report,
         )
         if request is not None:
@@ -457,14 +458,22 @@ async def anthropic_event_stream(
         block_index += 1
         return frames
 
-    # message_start (input_tokens filled in by the terminal message_delta).
-    yield _event(AnthropicStreamEvent(
-        type="message_start",
-        message=AnthropicMessagesResponse(
-            id=f"msg_{uid}", content=[], model=model,
-            usage=AnthropicUsage(input_tokens=0, output_tokens=0),
-        ),
-    ))
+    # message_start carries the real input size: clients (Claude Code etc.) read input_tokens
+    # from it, and it used to be a hard 0. It waits for GenAdmitted (the scheduler's admission,
+    # before prefill); keepalives before that go out as SSE comments, which clients ignore, so
+    # message_start still comes first. Any other event first (should not happen) -> 0 as before.
+    started = False
+
+    def _message_start(prompt_tokens: int = 0, cached_tokens: int = 0) -> str:
+        nonlocal started
+        started = True
+        return _event(AnthropicStreamEvent(
+            type="message_start",
+            message=AnthropicMessagesResponse(
+                id=f"msg_{uid}", content=[], model=model,
+                usage=_anthropic_usage(prompt_tokens, 0, cached_tokens, cache_report),
+            ),
+        ))
 
     def _open_tool(name: str | None, ordinal: int | None, stable: bool = True) -> list[str]:
         nonlocal block_open, tool_args_sent, tool_ordinal, tool_stable
@@ -498,6 +507,16 @@ async def anthropic_event_stream(
     events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
     try:
         async for ev in events:
+            if not started:
+                if ev is KEEPALIVE:
+                    yield ": keepalive\n\n"
+                    continue
+                if isinstance(ev, GenAdmitted):
+                    yield _message_start(ev.prompt_tokens, ev.cached_tokens)
+                    continue
+                yield _message_start()
+            if isinstance(ev, GenAdmitted):
+                continue
             if ev is KEEPALIVE:
                 yield _event(AnthropicStreamEvent(type="ping"))
 
@@ -578,6 +597,8 @@ async def anthropic_event_stream(
         # Request-side failure (template rejection / over-length prompt). Match the
         # non-streaming path's classification so Claude Code treats it as a client error
         # rather than a server fault to retry.
+        if not started:
+            yield _message_start()
         if block_open:
             for f in _stop_block():
                 yield f
@@ -585,6 +606,8 @@ async def anthropic_event_stream(
             type="error", error=AnthropicError(type="invalid_request_error", message=str(exc)),
         ))
     except Exception as exc:  # noqa: BLE001 — surface as an Anthropic error event
+        if not started:
+            yield _message_start()
         if block_open:
             for f in _stop_block():
                 yield f

@@ -55,6 +55,22 @@ Listens on `REQFILTER_PORT` (IPv4 and IPv6) and forwards only:
 `POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/responses`,
 `GET /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`.
 
+Other routes get 403. A generation request with empty input gets 400 `input tokens must be > 0`.
+
+Rules in `deploy/rules.json` (`REQFILTER_RULES`), re-read on change, no restart:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `nonstream_min_chars` | `1000` | non-streaming generation requests with a shorter prompt get 400 `backend doesn't support non-stream` |
+| `disconnect_grace_s` | `15` | seconds the upstream is kept after the client disconnects; then the generation is aborted |
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REQFILTER_UPSTREAM` | `http://127.0.0.1:1920` | engine address |
+| `REQFILTER_PORT` | `1922` | listen port |
+| `REQFILTER_RULES` | `deploy/rules.json` | rules file |
+| `REQFILTER_FALLBACK` | empty | second upstream used when the first refuses connections |
+
 ## Runtime defaults (no restart)
 
 Edit `deploy/runtime.json`; the next request uses the new values. Keys apply only when the request does not set the field itself.

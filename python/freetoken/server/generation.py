@@ -115,6 +115,15 @@ class GenDone:
     admitted_at: float | None = None  # monotonic time the prompt entered its first prefill batch
 
 
+@dataclass
+class GenAdmitted:
+    """The prompt was admitted by the scheduler (before prefill): its token count is known.
+    Emitted only when the consumer asks (emit_admitted=True) -- the Anthropic stream needs it for
+    message_start.usage.input_tokens, which clients read as the request's input size."""
+    prompt_tokens: int
+    cached_tokens: int = 0
+
+
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
 
 
@@ -601,7 +610,7 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, emit_admitted: bool = False
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -614,12 +623,14 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(uid, spec, state, emit_admitted=emit_admitted):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
                 cached_tokens = ev.cached_tokens
                 admitted_at = ev.admitted_at
+            elif isinstance(ev, GenAdmitted):
+                pass
             elif first_token_at is None:
                 first_token_at = time.monotonic()
             yield ev
@@ -660,7 +671,9 @@ async def generate_full(
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, emit_admitted: bool = False
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -768,11 +781,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
-        if admitted_at is None and ack.prompt_tokens_delta:
+        just_admitted = admitted_at is None and bool(ack.prompt_tokens_delta)
+        if just_admitted:
             admitted_at = time.monotonic()
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if just_admitted and emit_admitted:
+            yield GenAdmitted(prompt_tokens, cached_tokens)
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)

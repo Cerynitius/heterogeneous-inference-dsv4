@@ -38,6 +38,12 @@ import torch
 
 from freetoken.core import Batch
 
+from .spec_sample import SampleParams, accept as spec_accept, probs_from_logits
+
+# FREETOKEN_DSV4_SPEC_SAMPLE=1: sampling requests (T > 0, top-k / top-p) speculate too, via
+# speculative sampling (spec_sample.py; exact target distribution). 0 = greedy requests only.
+_SPEC_SAMPLE = os.environ.get("FREETOKEN_DSV4_SPEC_SAMPLE", "1") == "1"
+
 
 class _FakeReq:
     __slots__ = ("table_idx", "cached_len", "device_len", "linear_slot_idx",
@@ -77,6 +83,8 @@ class DsparkSpec:
         self.expect_dl = -1
         self.d_toks: torch.Tensor | None = None       # [B] draft tokens
         self.cache_gpu: torch.Tensor | None = None
+        self.samp = None   # SampleParams of the keyed request (None = greedy)
+        self.q: torch.Tensor | None = None   # [k, V] draft distributions (sampling)
         self.cache_pos = 0
         self.cache_len = 0
         self._last_conf: list | None = None
@@ -96,7 +104,7 @@ class DsparkSpec:
             return None
         req = batch.reqs[0]
         sp = req.sampling_params
-        if req.aborted or not (sp.temperature <= 0.0 or sp.top_k == 1) or not req.can_decode:
+        if req.aborted or not req.can_decode or not (sp.is_greedy or _SPEC_SAMPLE):
             return None
         keyed = req.uid == self.uid and req.device_len == self.expect_dl
         if keyed and self.cache_pos < self.cache_len:
@@ -155,9 +163,9 @@ class DsparkSpec:
                 self.draft.ring_reset(req.uid)
             self.draft.ring_write(positions, hiddens)
         t1 = next_tokens_gpu[:1].long()
-        toks, conf = self.draft.draft(t1[0])
-        self._last_conf = [round(float(v), 3) for v in conf.tolist()]
-        self.d_toks = self._trim(toks, conf)
+        sp = req.sampling_params
+        self.samp = None if sp.is_greedy else SampleParams.from_request(sp, self.args.vocab_size)
+        self._draft_next(t1[0])
         self.uid = req.uid
         self.expect_dl = req.device_len
         self.cache_pos = self.cache_len = 0
@@ -168,6 +176,17 @@ class DsparkSpec:
                   f" ring_valid={self.draft.ring_valid}", flush=True)
 
     # ------------------------------------------------------------------ internals
+    def _draft_next(self, tok: torch.Tensor) -> None:
+        if self.samp is None:
+            toks, conf = self.draft.draft(tok)
+            self.q = None
+        else:
+            toks, conf, q = self.draft.draft(tok, self.samp)
+        self._last_conf = [round(float(v), 3) for v in conf.tolist()]
+        self.d_toks = self._trim(toks, conf)
+        if self.samp is not None:
+            self.q = q[: self.d_toks.numel()]
+
     def _trim(self, toks: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
         """Confidence gating: submit the prefix with conf > threshold (default: all)."""
         if self.conf_thr <= -1e29:
@@ -254,14 +273,19 @@ class DsparkSpec:
             with eng.ctx.forward_batch(vb):
                 vlogits = eng.model.forward()            # [k+1, V] decode path
         h_all = model.spec_hidden_decode[:k + 1].clone()  # [k+1, 3D] target-layer means
-        greedy = vlogits.argmax(dim=-1)                  # [k+1]
 
         _tick(1)
-        # -- accept: longest draft prefix + bonus
-        matched = torch.cumprod((greedy[:k] == self.d_toks).int(), 0)
-        a = int(matched.sum().item())
-        a = min(a, req.remain_len - 1)
-        emitted = torch.cat([self.d_toks[:a], greedy[a:a + 1]])  # [a+1]
+        if self.samp is None:
+            # -- accept (greedy): longest draft prefix + bonus
+            greedy = vlogits.argmax(dim=-1)                  # [k+1]
+            matched = torch.cumprod((greedy[:k] == self.d_toks).int(), 0)
+            a = int(matched.sum().item())
+            a = min(a, req.remain_len - 1)
+            emitted = torch.cat([self.d_toks[:a], greedy[a:a + 1]])  # [a+1]
+        else:
+            # -- accept (speculative sampling): exact target sampling distribution
+            p_t = probs_from_logits(vlogits[:k + 1], self.samp)
+            a, emitted = spec_accept(p_t, self.q, self.d_toks, req.remain_len - 1)
 
         # -- carry fix (only when a draft was rejected): restore the pre-verify ring
         # carries, then re-chain over just the accepted a+1 tokens. A fully-accepted
@@ -299,9 +323,7 @@ class DsparkSpec:
                     f.write(f'{{"a": {a}, "conf": {self._last_conf}}}\n')
             except OSError:
                 pass
-        toks_next, conf = self.draft.draft(emitted[-1])
-        self._last_conf = [round(float(v), 3) for v in conf.tolist()]
-        self.d_toks = self._trim(toks_next, conf)
+        self._draft_next(emitted[-1])
         _tick(3)
 
         # -- bookkeeping: emit the first token now, cache the rest
