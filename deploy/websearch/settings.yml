@@ -1,0 +1,22 @@
+use_default_settings: true
+general:
+  instance_name: "local-websearch"
+  enable_metrics: false
+server:
+  secret_key: "CHANGE_ME"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats: [html, json]
+outgoing:
+  request_timeout: 4.0
+  max_request_timeout: 8.0
+  pool_connections: 100
+  pool_maxsize: 20
+  # proxies:            # optional outbound proxy for the search engines
+  #   all://:
+  #     - http://127.0.0.1:7890

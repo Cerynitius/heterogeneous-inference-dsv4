@@ -63,6 +63,8 @@ Rules in `deploy/rules.json` (`REQFILTER_RULES`), re-read on change, no restart:
 |---|---|---|
 | `nonstream_min_chars` | `1000` | non-streaming generation requests with a shorter prompt get 400 `backend doesn't support non-stream` |
 | `disconnect_grace_s` | `15` | seconds the upstream is kept after the client disconnects; then the generation is aborted |
+| `web_search` | `1` | `0` = hosted web_search tools are removed from requests |
+| `web_search_max_uses` | `8` | searches per request when the tool sets no `max_uses` |
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -70,6 +72,50 @@ Rules in `deploy/rules.json` (`REQFILTER_RULES`), re-read on change, no restart:
 | `REQFILTER_PORT` | `1922` | listen port |
 | `REQFILTER_RULES` | `deploy/rules.json` | rules file |
 | `REQFILTER_FALLBACK` | empty | second upstream used when the first refuses connections |
+| `WEBSEARCH_URL` | `http://127.0.0.1:1930` | search backend |
+
+## Web search (server-side tool)
+
+Start the search backend (SearXNG in Docker on 127.0.0.1:8888, backend on 127.0.0.1:1930, both loopback only):
+
+```bash
+pip install httpx starlette uvicorn trafilatura
+deploy/websearch/run.sh
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WEBSEARCH_PORT` | `1930` | listen port (127.0.0.1) |
+| `WEBSEARCH_SEARXNG` | `http://127.0.0.1:8888` | SearXNG address |
+| `WEBSEARCH_PROXY` | empty | outbound proxy for page fetches |
+| `WEBSEARCH_TEXT_CHARS` | `3000` | page text per result |
+
+Clients declare the hosted tool; the request filter runs the searches and continues the generation.
+
+Anthropic Messages:
+
+```json
+"tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5,
+           "allowed_domains": ["example.com"], "blocked_domains": []}]
+```
+
+Returns `server_tool_use` and `web_search_tool_result` blocks; `usage.server_tool_use.web_search_requests` counts searches. Send the blocks back unchanged in later turns.
+
+OpenAI Responses:
+
+```json
+"tools": [{"type": "web_search"}]
+```
+
+Returns `web_search_call` output items (`action.type` = `search`).
+
+Chat Completions:
+
+```json
+"web_search_options": {}
+```
+
+Searches stay internal; the reply contains the final answer.
 
 ## Runtime defaults (no restart)
 

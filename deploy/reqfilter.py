@@ -6,13 +6,17 @@ External traffic reaches this proxy first and is forwarded to the engine on 127.
 - Generation requests with empty input get 400 "input tokens must be > 0".
 - Non-streaming generation requests whose prompt is shorter than nonstream_min_chars characters get
   400 "backend doesn't support non-stream".
+- Requests that declare the hosted web_search tool are served by servertools.py (server-side search).
 - Streaming responses are passed through. When the client disconnects, the upstream connection is
   kept for disconnect_grace_s seconds, then closed, and the engine aborts the generation (a
   disconnect is also noticed while a non-streaming request is still waiting for its response).
-Thresholds live in rules.json (REQFILTER_RULES); edits apply to the next request, no restart.
+Settings live in rules.json (REQFILTER_RULES); edits apply to the next request, no restart.
 """
 import asyncio, json, logging, os, re
 import httpx, uvicorn
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # run with python -I
+import servertools  # noqa: E402
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -36,7 +40,7 @@ HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding"
        "proxy-connection", "proxy-authorization"}
 log = logging.getLogger("reqfilter")
 RULES_FILE = os.environ.get("REQFILTER_RULES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.json"))
-RULES_DEFAULT = {"nonstream_min_chars": 1000, "disconnect_grace_s": 15}
+RULES_DEFAULT = {"nonstream_min_chars": 1000, "disconnect_grace_s": 15, "web_search": 1, "web_search_max_uses": 8}
 _rules = {"key": None, "val": dict(RULES_DEFAULT)}
 GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
 PROMPT_FIELDS = ("messages", "prompt", "input", "system", "instructions", "tools")
@@ -56,7 +60,7 @@ def rules() -> dict:
         if key is not None:
             try:
                 doc = json.load(open(RULES_FILE))
-                for k in ("nonstream_min_chars", "disconnect_grace_s"):
+                for k in RULES_DEFAULT:
                     n = doc.get(k, val[k])
                     if not isinstance(n, (int, float)) or isinstance(n, bool) or n < 0:
                         raise ValueError(f"{k} must be a number >= 0, got {n!r}")
@@ -99,6 +103,7 @@ async def handle(request: Request):
     if not any(m == method and rx.fullmatch(path) for m, rx in ALLOW):
         return deny(request, 403, f"{method} {path} is not allowed on this endpoint")
     body = b""
+    loop = None
     if method == "POST":
         raw = await request.body()
         if path.endswith("/cancel") and not raw:
@@ -134,10 +139,15 @@ async def handle(request: Request):
                         err = {"error": {"type": "invalid_request_error", "code": "stream_required",
                                          "message": NONSTREAM_MSG}}
                     return JSONResponse(err, status_code=400)
+            if path in ("/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/chat/completions"):
+                r = rules()
+                loop = servertools.prepare(path, doc, bool(r["web_search"]), int(r["web_search_max_uses"]))
             body = json.dumps(doc, ensure_ascii=False).encode()
     headers = [(k, v) for k, v in request.headers.items() if k.lower() not in HOP]
     if body:
         headers = [(k, v) for k, v in headers if k.lower() != "content-type"] + [("content-type", "application/json")]
+    if loop is not None:
+        return await run_loop(request, loop, headers, path)
     disc = asyncio.create_task(_wait_disconnect(request))
     send = asyncio.create_task(_send(method, path, request.query_params, headers, body))
     await asyncio.wait({send, disc}, return_when=asyncio.FIRST_COMPLETED)
@@ -162,6 +172,92 @@ async def handle(request: Request):
                             status_code=502)
     out_headers = {k: v for k, v in up.headers.items() if k.lower() not in HOP and k.lower() != "content-encoding"}
     return StreamingResponse(relay(up, disc, path), status_code=up.status_code, headers=out_headers)
+
+
+async def run_loop(request: Request, loop, headers, path: str):
+    """A request that declared the hosted web_search tool: servertools runs the search rounds."""
+    async def post(p: str, b: bytes) -> httpx.Response:
+        return await _send("POST", p, {}, headers, b)
+
+    log.info("web_search loop on %s (stream=%s, max_uses=%d)", path, loop.stream, loop.max_uses)
+    disc = asyncio.create_task(_wait_disconnect(request))
+    send = asyncio.create_task(post(path, loop.first_body()))
+    await asyncio.wait({send, disc}, return_when=asyncio.FIRST_COMPLETED)
+    if not send.done():
+        grace = rules()["disconnect_grace_s"]
+        await asyncio.wait({send}, timeout=grace)
+        if not send.done():
+            send.cancel()
+            await asyncio.gather(send, return_exceptions=True)
+        elif send.exception() is None:
+            await send.result().aclose()
+        return Response(status_code=499)
+    try:
+        up = send.result()
+    except httpx.HTTPError as e:
+        disc.cancel()
+        log.error("upstream error POST %s: %s: %s", path, type(e).__name__, e)
+        return JSONResponse({"error": {"type": "upstream_unavailable", "message": f"{type(e).__name__}: {e}"}},
+                            status_code=502)
+    if up.status_code != 200:                  # engine rejected the request: pass its answer through
+        out_headers = {k: v for k, v in up.headers.items() if k.lower() not in HOP and k.lower() != "content-encoding"}
+        return StreamingResponse(relay(up, disc, path), status_code=up.status_code, headers=out_headers)
+    if loop.stream:
+        return StreamingResponse(relay_gen(loop.events(up, post), disc, path), status_code=200,
+                                 headers={"content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache"})
+    coll = asyncio.create_task(loop.collect(up, post))
+    await asyncio.wait({coll, disc}, return_when=asyncio.FIRST_COMPLETED)
+    if not coll.done():
+        grace = rules()["disconnect_grace_s"]
+        await asyncio.wait({coll}, timeout=grace)
+        if not coll.done():
+            coll.cancel()
+            await asyncio.gather(coll, return_exceptions=True)
+            return Response(status_code=499)
+    disc.cancel()
+    try:
+        return JSONResponse(coll.result())
+    except Exception as e:  # noqa: BLE001
+        log.error("web_search loop on %s failed: %s: %s", path, type(e).__name__, e)
+        return JSONResponse({"error": {"type": "server_error", "message": f"{type(e).__name__}: {e}"}}, status_code=502)
+
+
+async def relay_gen(gen, disc: asyncio.Task, path: str):
+    """relay() for a servertools event generator: same disconnect race and grace, then the generator is
+    cancelled, which closes its upstream response and aborts the generation."""
+    nxt = None
+    finished = False
+    try:
+        while True:
+            nxt = asyncio.ensure_future(gen.__anext__())
+            await asyncio.wait({nxt, disc}, return_when=asyncio.FIRST_COMPLETED)
+            if not nxt.done():
+                break
+            try:
+                chunk = nxt.result()
+            except StopAsyncIteration:
+                finished = True
+                break
+            nxt = None
+            yield chunk
+    finally:
+        disc.cancel()
+        if not finished:
+            t = asyncio.create_task(_close_gen_later(gen, nxt, path))
+            _closers.add(t)
+            t.add_done_callback(_closers.discard)
+
+
+async def _close_gen_later(gen, nxt, path: str) -> None:
+    grace = rules()["disconnect_grace_s"]
+    log.info("client gone on %s (web_search loop), keeping it %ss", path, grace)
+    await asyncio.sleep(grace)
+    if nxt is not None and not nxt.done():
+        nxt.cancel()
+        await asyncio.gather(nxt, return_exceptions=True)
+    else:
+        await gen.aclose()
+    log.info("web_search loop on %s closed", path)
 
 
 async def _wait_disconnect(request: Request) -> None:

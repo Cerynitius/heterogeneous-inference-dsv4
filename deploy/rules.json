@@ -1,1 +1,1 @@
-{"nonstream_min_chars": 1000, "disconnect_grace_s": 15}
+{"nonstream_min_chars": 1000, "disconnect_grace_s": 15, "web_search": 1, "web_search_max_uses": 8}
