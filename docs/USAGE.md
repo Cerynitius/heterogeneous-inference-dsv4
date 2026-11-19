@@ -89,6 +89,12 @@ deploy/websearch/run.sh
 | `WEBSEARCH_SEARXNG` | `http://127.0.0.1:8888` | SearXNG address |
 | `WEBSEARCH_PROXY` | empty | outbound proxy for page fetches |
 | `WEBSEARCH_TEXT_CHARS` | `3000` | page text per result |
+| `WEBSEARCH_TAVILY_KEY_FILE` | `deploy/websearch/tavily.key` | Tavily API key file; missing = SearXNG only |
+| `WEBSEARCH_TAVILY_DEPTH` | `basic` | Tavily `search_depth` (`basic` 1 credit, `advanced` 2) |
+| `WEBSEARCH_CACHE_TTL` | `21600` | seconds a query's results are reused |
+| `WEBSEARCH_CACHE_DB` | `deploy/websearch/cache.db` | cache file |
+
+Each search queries Tavily and SearXNG in parallel and merges the results (SearXNG first for CJK queries). Pages without text are fetched directly; pages that fail are read with Tavily extract.
 
 Clients declare the hosted tool; the request filter runs the searches and continues the generation.
 
