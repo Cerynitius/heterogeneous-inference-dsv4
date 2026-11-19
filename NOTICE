@@ -1,0 +1,9 @@
+heterogeneous-inference-dsv4
+Copyright 2026 Cerynitius
+
+This product is a modified version of FreeToken (https://github.com/FlashML-org/FreeToken),
+Copyright FlashML Team, licensed under the Apache License, Version 2.0.
+
+Modifications: DeepSeek-V4 two-GPU expert parallelism, KV packing and indexer formats,
+prefill and decode kernels, host-RAM L2 prefix cache, hot-reloadable request defaults,
+deployment scripts (deploy/).

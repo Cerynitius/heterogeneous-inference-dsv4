@@ -1,0 +1,88 @@
+# Usage
+
+## Requirements
+
+- Linux, two NVIDIA GPUs: a 96 GB card as GPU 0 and a 72 GB card as GPU 1 (RTX PRO 6000 + RTX PRO 5000 Blackwell)
+- CUDA toolkit (`CUDA_HOME`) for the C++ extensions and the JIT-compiled CUDA kernels
+- Python 3.12, about 90 GiB of free host RAM (64 GiB of it for the L2 prefix cache)
+- Checkpoint: `deepseek-ai/DeepSeek-V4-Flash-0731`, downloaded to a local directory
+
+## Install
+
+```bash
+git clone https://github.com/Cerynitius/heterogeneous-inference-dsv4
+cd heterogeneous-inference-dsv4
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e .
+```
+
+`pip install -e .` installs the dependencies from `pyproject.toml` and builds `freetoken.kernel._pinned_tensor` and `freetoken.kernel._cpu_moe`.
+
+## Run
+
+```bash
+DSV4_MODEL=/path/to/DeepSeek-V4-Flash-0731 deploy/serve.sh
+```
+
+The server is ready when `POST /v1/chat/completions` answers.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DSV4_MODEL` | (required) | checkpoint directory |
+| `DSV4_PORT` | `1920` | engine port |
+| `DSV4_HOST` | `127.0.0.1` | engine bind address |
+| `DSV4_NAME` | `dsv4-flash` | served model name |
+| `CUDA_VISIBLE_DEVICES` | `0,1` | large card first |
+| `FREETOKEN_DSV4_EP_N1` | `125` | routed experts per layer on GPU 1 |
+| `FREETOKEN_DSV4_L2_GB` | `64` | host L2 prefix cache size, GiB |
+| `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
+| `FT` | `ft` | engine CLI |
+
+Limits: 1,048,576 tokens per request (input + output), 2 concurrent requests.
+
+## Request filter
+
+```bash
+pip install httpx starlette uvicorn
+REQFILTER_UPSTREAM=http://127.0.0.1:1920 REQFILTER_PORT=1922 python deploy/reqfilter.py
+```
+
+Listens on `REQFILTER_PORT` (IPv4 and IPv6) and forwards only:
+`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`,
+`POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST /v1/responses`,
+`GET /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`.
+
+## Runtime defaults (no restart)
+
+Edit `deploy/runtime.json`; the next request uses the new values. Keys apply only when the request does not set the field itself.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `default_max_output_tokens` | int ≥ 1 | output budget when `max_tokens` is omitted |
+| `default_thinking` | bool | thinking mode when the request sends no thinking switch |
+| `default_reasoning_effort` | `"low"` / `"high"` / `"max"` / null | effort in thinking mode |
+| `temperature` | number | default temperature |
+| `top_p` | number | default top_p |
+| `top_k` | int | default top_k |
+| `force_temperature` | number / null | every request samples at this temperature |
+
+An invalid file is rejected; the engine logs the error and keeps the last valid values. Deleting the file returns to the startup defaults.
+
+## API
+
+OpenAI Chat Completions, OpenAI Responses and Anthropic Messages:
+
+```bash
+curl http://127.0.0.1:1920/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "dsv4-flash",
+  "messages": [{"role": "user", "content": "hello"}],
+  "chat_template_kwargs": {"enable_thinking": false}
+}'
+```
+
+| Field | Effect |
+|---|---|
+| `chat_template_kwargs.enable_thinking` | `true` / `false`: thinking on or off |
+| `reasoning_effort` | `low`, `high`, `max` |
+| `thinking: {"type": "enabled" \| "disabled"}` | Anthropic / DeepSeek thinking switch |
+| `tools` | tool calling (always runs in thinking mode) |

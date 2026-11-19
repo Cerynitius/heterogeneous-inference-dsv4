@@ -1,0 +1,218 @@
+"""GLM-5.2 sparse MoE block.
+
+Identical routing to glm4_moe (``Glm4MoeSparseBlock``): sigmoid scores + a selection-only
+``e_score_correction_bias``, optional group-limited top-k, gather unbiased scores,
+renormalize, scale by ``routed_scaling_factor``. The routed experts go through
+``make_moe_layer`` (the offload family for NVFP4) and the always-on shared expert is
+added. The only GLM-5.2 difference from glm4_moe is the shared expert is bf16
+(unquantized) rather than NVFP4.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Tuple
+
+import os as _os
+
+import torch
+import torch.nn.functional as F
+from freetoken.layers import BaseOP, LinearReplicated, OffloadMoELayer, make_moe_layer
+
+from .mlp import GlmDsaGatedMLP
+
+if TYPE_CHECKING:
+    from freetoken.models.config import ModelConfig
+
+TopK = Tuple[torch.Tensor, torch.Tensor]
+
+# Both default OFF; unset = the previous code path exactly.
+# FREETOKEN_GLM5_SOFT_RANK=1: with FREETOKEN_MOE_CACHE_POLICY=soft, a bs==1 router call also
+# emits the ranked list (top-8 + next-8 by GLM's own selection score sigmoid+bias[+group
+# mask], with raw sigmoid scores) that moe/soft_ensure.py weights its cache touches by --
+# the list the Naive router stashes (naive_n05/model.py NaiveMoE._route). Routing ids and
+# weights are unchanged (fused_route_ranked: same kernel loop, ranks < top_k == fused_route).
+_SOFT_RANK = _os.environ.get("FREETOKEN_GLM5_SOFT_RANK", "0") == "1"
+_LEGACY_NUMERICS = _os.environ.get("FREETOKEN_GLM5_LEGACY_NUMERICS", "0") == "1"
+_SOFT_NRANK = 16  # list length, as in Naive (8 selected + 8 near-misses)
+# FREETOKEN_GLM5_SOFT_RANK_BS2=1 (with FREETOKEN_GLM5_SOFT_RANK=1): also emit the ranked list
+# for 2 <= bs <= _SOFT_RANK_MAXM, as [M, 16] per-token rows (each row: that token's top-8
+# then its next-8, distinct within the row). The rows may share ids; soft_ensure merges them
+# into one touch per distinct id inside its kernel (first occurrence, summed weight), so the
+# list stays fixed-shape and graph-capturable. Routing ids/weights unchanged (same kernels
+# as bs==1: fused_route_ranked's (w, ids) == fused_route's for every row).
+_SOFT_RANK_BS2 = _os.environ.get("FREETOKEN_GLM5_SOFT_RANK_BS2", "0") == "1"
+_SOFT_RANK_MAXM = 4  # merged list R = M*16 <= 64: a [64, 64] compare in one CTA
+# FREETOKEN_GLM5_SHARED_OVERLAP=1: with the hit/miss split decode (FREETOKEN_MOE_SPLIT_OVERLAP
+# =1), run the shared expert on the main stream right after this layer's miss copy is queued
+# on the side stream (layers/moe.py _decode_split), i.e. while the copy is in flight, instead
+# of after the routed sum-reduce. Same call on the same input, result held and added exactly
+# as before (``out = routed + shared``) -> bit-identical. Every path that does not reach the
+# split decode (prefill, resident/CPU/hybrid/miss-cap layers, split off) computes it after,
+# as before.
+_SHARED_OVERLAP = _os.environ.get("FREETOKEN_GLM5_SHARED_OVERLAP", "0") == "1"
+# FREETOKEN_GLM5_GATE_FP32_CACHE=1: upcast the bf16 router gate to fp32 ONCE at load instead
+# of ``.float()`` on every call (here and in SpecPrefetch); same fp32 values, bit-identical.
+_GATE_FP32_CACHE = _os.environ.get("FREETOKEN_GLM5_GATE_FP32_CACHE", "0") == "1"
+
+
+class GlmMoeDsaSparseBlock(BaseOP):
+    def __init__(self, config: ModelConfig, layer_id: int):
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.norm_topk_prob = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+
+        self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        # DeepSeek-style selection bias, kept fp32 as in HF (_keep_in_fp32_modules_strict) and the
+        # checkpoint. It is NOT "exact enough" in bf16: GLM-5.3's biases are ~11.5 (max 14.5), so bf16
+        # rounds them by up to 0.03 -- a fixed per-expert offset next to sigmoid scores in (0, 1),
+        # which flips near-tied top-8 picks (review 2026-10-02). FREETOKEN_GLM5_LEGACY_NUMERICS=1
+        # restores the old bf16 storage for A/B only.
+        self.e_score_correction_bias = torch.empty(
+            config.num_experts, dtype=None if _LEGACY_NUMERICS else torch.float32)
+
+        # The offload cache indexes experts by *MoE* layer (global layer minus
+        # first_k_dense_replace), matching how the loader packs the expert banks.
+        # Subclasses (glm5_next: resident split) override _make_experts.
+        self.experts = self._make_experts(config, layer_id)
+        # Speculative prefetch: the offload layer predicts the NEXT layer's routing
+        # with that layer's own gate; register by reference (survives weight load).
+        if hasattr(self.experts, "spec_set_block"):
+            self.experts.spec_set_block(self)
+        self.shared_experts = GlmDsaGatedMLP(
+            config.hidden_size,
+            config.moe_intermediate_size * max(1, config.n_shared_experts),
+            quant=config.dense_quant,
+        )
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        if _GATE_FP32_CACHE and self.gate.weight.dtype != torch.float32:
+            # Done at load, i.e. BEFORE the engine measures post-weights free VRAM, so
+            # --moe-cache-auto sizes the expert cache with these bytes accounted. The bf16
+            # tensor is dropped; every reader already calls ``.float()`` on it (_route,
+            # SpecPrefetch), which on an fp32 tensor returns it unchanged -- the exact
+            # values the per-call cast produced, so the gate GEMV is bit-identical.
+            self.gate.weight = self.gate.weight.float()
+
+    def _soft_rank_cache(self, hidden_states: torch.Tensor):
+        """The offload cache whose next ensure should get this call's ranked list, or None.
+        bs==1 only (the soft kernel needs distinct ids in the list; a [M, 16] union has
+        duplicates), offload-backed experts only (resident experts never ensure). Static
+        per captured graph: the bs==1 graph bakes the ranked route, bs>=2 the plain one.
+        FREETOKEN_GLM5_SOFT_RANK_BS2=1 extends it to 2 <= bs <= 4 (rows merged in-kernel)."""
+        if not _SOFT_RANK or (hidden_states.shape[0] != 1 and not (
+                _SOFT_RANK_BS2 and hidden_states.shape[0] <= _SOFT_RANK_MAXM)):
+            return None
+        cache = getattr(self.experts, "offload_cache", None)
+        if cache is None or cache.cache_policy != "soft":
+            return None
+        if self.n_group > 1 and self.topk_group * (self.num_experts // self.n_group) < _SOFT_NRANK:
+            return None  # too few group-admissible candidates for a distinct list
+        return cache
+
+    def _make_experts(self, config: ModelConfig, layer_id: int):
+        return make_moe_layer(
+            config,
+            layer_id=layer_id - config.first_k_dense_replace,
+            renormalize=config.norm_topk_prob,
+            # GLM-5.3 experts clamp swiglu at config.swiglu_limit (GLM-5.2: None -> silu).
+            # Only the Triton NVFP4 kernels honor the limit, so backend auto resolves there
+            # (marlin/b12x hard-code plain silu and are rejected for this kind).
+            activation="swiglu_clamp" if getattr(config, "swiglu_limit", None) else "silu",
+        )
+
+    def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
+        m = scores_for_choice.shape[0]
+        e, g = self.num_experts, self.n_group
+        group_scores = scores_for_choice.view(m, g, e // g).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1.0)
+        score_mask = group_mask.unsqueeze(-1).expand(m, g, e // g).reshape(m, e)
+        return scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+
+    def _route(self, hidden_states: torch.Tensor) -> TopK:
+        # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
+        logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        soft_cache = self._soft_rank_cache(hidden_states)
+        if self.n_group <= 1 and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1":
+            # tail-fusion (2026-08-28): sigmoid/+bias/topk/gather/renorm/cast chain
+            # (~8 launches) -> one kernel. Same math; see fused_route docstring.
+            from freetoken.kernel.triton.fused_route import fused_route
+
+            if soft_cache is not None:
+                from freetoken.kernel.triton.fused_route import fused_route_ranked
+
+                # same (weights, ids) as fused_route + the [1, 16] ranked list, written
+                # in place by the one kernel (graph-capturable; consumed by this layer's
+                # ensure_experts, cleared in forward otherwise)
+                w, ids, rid, rsc = fused_route_ranked(
+                    logits, self.e_score_correction_bias, self.top_k,
+                    self.norm_topk_prob, self.routed_scaling_factor, n_rank=_SOFT_NRANK,
+                )
+                soft_cache._soft_rank = (rid, rsc)
+                return w, ids
+            return fused_route(
+                logits, self.e_score_correction_bias, self.top_k,
+                self.norm_topk_prob, self.routed_scaling_factor,
+            )
+        scores = logits.sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias.float()
+        if self.n_group > 1:
+            scores_for_choice = self._group_limited(scores_for_choice)
+        _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
+        if soft_cache is not None:
+            # Eager twin of fused_route_ranked: the selected ids first (unchanged), then
+            # the next-best by the same selection score with the selected (and, grouped,
+            # the masked groups) excluded. Read-only w.r.t. topk_ids/scores.
+            nm = scores_for_choice.scatter(-1, topk_ids, float("-inf"))
+            nm_ids = torch.topk(nm, _SOFT_NRANK - self.top_k, dim=-1)[1]
+            rank_ids = torch.cat([topk_ids, nm_ids], dim=-1)
+            soft_cache._soft_rank = (
+                rank_ids.to(torch.int32).contiguous(),
+                scores.gather(-1, rank_ids).contiguous(),
+            )
+        topk_weights = scores.gather(-1, topk_ids)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        import os as _os
+        if _os.environ.get("FREETOKEN_GLM5_STUB_MOE", "0") == "1":  # ablation timing only
+            return torch.zeros_like(hidden_states)
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        topk_weights, topk_ids = self._route(hidden_states)
+        shared = None
+        if _SHARED_OVERLAP and isinstance(self.experts, OffloadMoELayer):
+            # resident experts (ResidentNvfp4Experts / MoELayer) take no hook and copy
+            # nothing: they keep the plain call below
+            held = []
+            out = self.experts.routed_forward(
+                hidden_states, topk_weights, topk_ids,
+                split_overlap_fn=lambda: held.append(self.shared_experts.forward(hidden_states)),
+            )
+            if held:
+                shared = held[0]
+        else:
+            out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        if _SOFT_RANK:
+            # The decode ensure consumed (and cleared) the list; paths that never ensure
+            # (bs==1 last-token prefill, CPU/hybrid/miss-cap layers) must not leak it into
+            # another layer's ensure. Python-side only, nothing captured.
+            c = getattr(self.experts, "offload_cache", None)
+            if c is not None:
+                c._soft_rank = None
+        if shared is None:
+            out = out + self.shared_experts.forward(hidden_states)
+        else:
+            out = out + shared  # same add, same operands/order: routed first, then + shared
+        return out.view(num_tokens, hidden_dim)
+
+
+__all__ = ["GlmMoeDsaSparseBlock"]
