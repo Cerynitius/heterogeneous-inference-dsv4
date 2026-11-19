@@ -150,6 +150,16 @@ class IndexerBackendMixin:
 
             qc, qe = to_i8(q[0])
             kc, ke = to_i8(keys[0])
+        if fp4 and _TOPK_CUDA:
+            # query split across the two EP cards (attention/dsv4_idx_split.py; off unless
+            # FREETOKEN_DSV4_IDX_SPLIT > 0): same kernels and arguments per query -> bitwise picks
+            from freetoken.attention import dsv4_idx_split as _split
+            if _split.wanted(n_blocks, seqlen):
+                picks = _split.split_select(qp4, qe4, kp4, ke4, w4, start_pos=start_pos, seqlen=seqlen,
+                                            ratio=ratio, topk=topk, offset=offset, qs=_FP4_QS,
+                                            local_slice=SLICE)
+                if picks is not None:
+                    return picks.unsqueeze(0)
         outs = []
         for s0 in range(0, seqlen, SLICE):
             sl = slice(s0, min(s0 + SLICE, seqlen))

@@ -33,7 +33,10 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `DSV4_HOST` | `127.0.0.1` | engine bind address |
 | `DSV4_NAME` | `dsv4-flash` | served model name |
 | `CUDA_VISIBLE_DEVICES` | `0,1` | large card first |
-| `FREETOKEN_DSV4_EP_N1` | `125` | routed experts per layer on GPU 1 |
+| `FREETOKEN_DSV4_EP_N1` | `124` | routed experts per layer on GPU 1 |
+| `FREETOKEN_DSV4_IDX_SPLIT` | `0.4` | share of deep prefill indexer queries scored on GPU 1, `0` = off |
+| `FREETOKEN_DSV4_IDX_SPLIT_MIN_WORK` | `1.1e8` | split only when queries × key blocks of a call reach this |
+| `FREETOKEN_DSV4_IDX_SPLIT_MARGIN_MB` | `768` | free MiB GPU 1 must keep after the split workspace, else the split stays off |
 | `FREETOKEN_DSV4_L2_GB` | `64` | host L2 prefix cache size, GiB |
 | `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
 | `FT` | `ft` | engine CLI |

@@ -23,8 +23,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Expert parallelism across the two cards.
 export FREETOKEN_DSV4_EP=1
-# Routed experts per layer placed on GPU 1 (125 fits an RTX PRO 5000 72 GB next to the L2 page tables).
-export FREETOKEN_DSV4_EP_N1=${FREETOKEN_DSV4_EP_N1:-125}
+# Routed experts per layer placed on GPU 1 (124 leaves the RTX PRO 5000 72 GB room for the L2 page tables
+# and the indexer split workspace).
+export FREETOKEN_DSV4_EP_N1=${FREETOKEN_DSV4_EP_N1:-124}
+# Indexer query split: share of each deep prefill indexer call scored on GPU 1 (0 = off).
+export FREETOKEN_DSV4_IDX_SPLIT=${FREETOKEN_DSV4_IDX_SPLIT:-0.4}
 
 # Kernels.
 export FREETOKEN_DSFP4_GEMV=v2
