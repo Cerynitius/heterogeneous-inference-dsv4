@@ -33,6 +33,7 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `DSV4_HOST` | `127.0.0.1` | engine bind address |
 | `DSV4_NAME` | `dsv4-flash` | served model name |
 | `CUDA_VISIBLE_DEVICES` | `0,1` | large card first |
+| `DSV4_MAX_RUNNING` | `4` | request slots allocated at startup; upper bound of `max_running_requests` |
 | `FREETOKEN_DSV4_EP_N1` | `124` | routed experts per layer on GPU 1 |
 | `FREETOKEN_DSV4_IDX_SPLIT` | `0.4` | share of deep prefill indexer queries scored on GPU 1, `0` = off |
 | `FREETOKEN_DSV4_IDX_SPLIT_MIN_WORK` | `1.1e8` | split only when queries × key blocks of a call reach this |
@@ -41,7 +42,7 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
 | `FT` | `ft` | engine CLI |
 
-Limits: 1,048,576 tokens per request (input + output), 2 concurrent requests.
+Limits: 1,048,576 tokens per request (input + output); concurrent requests = `max_running_requests` in `deploy/runtime.json` (2), at most `DSV4_MAX_RUNNING`.
 
 ## Request filter
 
@@ -65,14 +66,21 @@ Rules in `deploy/rules.json` (`REQFILTER_RULES`), re-read on change, no restart:
 | `disconnect_grace_s` | `15` | seconds the upstream is kept after the client disconnects; then the generation is aborted |
 | `web_search` | `1` | `0` = hosted web_search tools are removed from requests |
 | `web_search_max_uses` | `8` | searches per request when the tool sets no `max_uses` |
+| `web_search_results` | `8` | results per search |
+| `web_search_fetch` | `5` | results per search whose page text is fetched |
+| `upstream` | `REQFILTER_UPSTREAM` | engine address |
+| `fallback` | `REQFILTER_FALLBACK` | second upstream used when the first refuses connections, `""` = none |
+| `websearch_url` | `WEBSEARCH_URL` | search backend |
+
+A file with an unknown key or a bad value is rejected; the last valid values stay.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REQFILTER_UPSTREAM` | `http://127.0.0.1:1920` | engine address |
 | `REQFILTER_PORT` | `1922` | listen port |
 | `REQFILTER_RULES` | `deploy/rules.json` | rules file |
-| `REQFILTER_FALLBACK` | empty | second upstream used when the first refuses connections |
-| `WEBSEARCH_URL` | `http://127.0.0.1:1930` | search backend |
+| `REQFILTER_UPSTREAM` | `http://127.0.0.1:1920` | `upstream` when rules.json omits it |
+| `REQFILTER_FALLBACK` | empty | `fallback` when rules.json omits it |
+| `WEBSEARCH_URL` | `http://127.0.0.1:1930` | `websearch_url` when rules.json omits it |
 
 ## Web search (server-side tool)
 
@@ -83,15 +91,25 @@ pip install httpx starlette uvicorn trafilatura
 deploy/websearch/run.sh
 ```
 
+Settings in `deploy/websearch/conf.json` (`WEBSEARCH_CONF`), re-read on change, no restart. A missing key uses the variable; a bad file is rejected and the last valid values stay.
+
+| Key | Variable | Default | Meaning |
+|---|---|---|---|
+| `searxng` | `WEBSEARCH_SEARXNG` | `http://127.0.0.1:8888` | SearXNG address |
+| `proxy` | `WEBSEARCH_PROXY` | empty | outbound proxy for page fetches and Tavily |
+| `fetch_timeout` | `WEBSEARCH_FETCH_TIMEOUT` | `6` | seconds per page fetch |
+| `text_chars` | `WEBSEARCH_TEXT_CHARS` | `3000` | page text per result |
+| `tavily_key_file` | `WEBSEARCH_TAVILY_KEY_FILE` | `deploy/websearch/tavily.key` | Tavily API key file; missing = SearXNG only |
+| `tavily_depth` | `WEBSEARCH_TAVILY_DEPTH` | `basic` | Tavily `search_depth` (`basic` 1 credit, `advanced` 2) |
+| `cache_ttl` | `WEBSEARCH_CACHE_TTL` | `21600` | seconds a query's results are reused |
+| `hard_host_ttl` | | `86400` | seconds a site that blocked a direct fetch goes straight to Tavily extract |
+
+Startup only:
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `WEBSEARCH_PORT` | `1930` | listen port (127.0.0.1) |
-| `WEBSEARCH_SEARXNG` | `http://127.0.0.1:8888` | SearXNG address |
-| `WEBSEARCH_PROXY` | empty | outbound proxy for page fetches |
-| `WEBSEARCH_TEXT_CHARS` | `3000` | page text per result |
-| `WEBSEARCH_TAVILY_KEY_FILE` | `deploy/websearch/tavily.key` | Tavily API key file; missing = SearXNG only |
-| `WEBSEARCH_TAVILY_DEPTH` | `basic` | Tavily `search_depth` (`basic` 1 credit, `advanced` 2) |
-| `WEBSEARCH_CACHE_TTL` | `21600` | seconds a query's results are reused |
+| `WEBSEARCH_CONF` | `deploy/websearch/conf.json` | settings file |
 | `WEBSEARCH_CACHE_DB` | `deploy/websearch/cache.db` | cache file |
 
 Each search queries Tavily and SearXNG in parallel and merges the results (SearXNG first for CJK queries). Pages without text are fetched directly; pages that fail are read with Tavily extract.
@@ -125,7 +143,7 @@ Searches stay internal; the reply contains the final answer.
 
 ## Runtime defaults (no restart)
 
-Edit `deploy/runtime.json`; the next request uses the new values. Keys apply only when the request does not set the field itself.
+Edit `deploy/runtime.json`; the next request uses the new values. Sampling and thinking keys apply only when the request does not set the field itself; a missing key uses the startup value.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -136,6 +154,18 @@ Edit `deploy/runtime.json`; the next request uses the new values. Keys apply onl
 | `top_p` | number | default top_p |
 | `top_k` | int | default top_k |
 | `force_temperature` | number / null | every request samples at this temperature |
+| `max_running_requests` | int ≥ 1 | requests run at once, at most `DSV4_MAX_RUNNING`; lowering it does not stop running requests |
+| `prefill_chunk_tokens` | int ≥ 1 | prefill chunk size, at most the startup chunk (8192) |
+| `idx_split` | 0–1 | share of deep prefill indexer queries scored on GPU 1, `0` = off |
+| `idx_split_min_work` | number ≥ 0 | split only when queries × key blocks of a call reach this |
+| `sched_decode_share` | 0–0.95 | GPU time running decodes get while prompts prefill |
+| `sched_reserve_tokens` | int ≥ 0 | future tokens reserved per running request, `0` = all of `max_tokens` |
+| `sched_short_first` | bool | short prompts overtake a long chunked prefill |
+| `sched_aligned_chunks` | bool | a new prompt waits for a whole chunk instead of a leftover slice |
+| `swa_eviction_interval` | int ≥ 1 | decode steps between frees of out-of-window sliding pages |
+| `ep_prefill_split` | int ≥ 1 | MoE sub-chunks per prefill chunk across the two cards |
+| `ep_prefill_split_ratio` | 0–1 | size ratio of consecutive sub-chunks |
+| `forward_unknown_tools` | bool | pass through tool calls whose name the request did not declare |
 
 An invalid file is rejected; the engine logs the error and keeps the last valid values. Deleting the file returns to the startup defaults.
 

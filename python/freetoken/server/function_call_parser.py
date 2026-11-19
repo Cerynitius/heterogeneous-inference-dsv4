@@ -61,7 +61,9 @@ else:
 
 
 def _should_forward_unknown_tool(name: Any) -> bool:
-    return FORWARD_UNKNOWN_TOOLS or (isinstance(name, str) and ":" in name)
+    from freetoken.runtime_conf import runtime_overrides
+    hot = runtime_overrides().get("forward_unknown_tools")
+    return (FORWARD_UNKNOWN_TOOLS if hot is None else hot) or (isinstance(name, str) and ":" in name)
 
 
 TOOLS_TAG_LIST = [

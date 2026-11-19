@@ -1,0 +1,10 @@
+{
+  "searxng": "http://127.0.0.1:8888",
+  "proxy": "",
+  "fetch_timeout": 6,
+  "text_chars": 3000,
+  "tavily_key_file": "tavily.key",
+  "tavily_depth": "basic",
+  "cache_ttl": 21600,
+  "hard_host_ttl": 86400
+}

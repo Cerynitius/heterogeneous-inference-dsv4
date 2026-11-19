@@ -68,6 +68,6 @@ exec ${FT:-ft} serve \
   --memory-ratio 0.95 \
   --kv-reserve-tokens 2097152 \
   --max-seq-len-override 1048576 \
-  --max-running-requests 2 \
+  --max-running-requests ${DSV4_MAX_RUNNING:-4} \
   --num-tokens 2097152 \
   --swa-num-tokens 142

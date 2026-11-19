@@ -32,6 +32,7 @@ import os
 
 import torch
 
+from freetoken.runtime_conf import runtime_overrides
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -59,9 +60,20 @@ KB, KE = 64, 4                  # packed key bytes, key exponent bytes
 TOPK_W = 512                    # picks width the workspace holds (index_topk)
 
 
+def _frac() -> float:
+    """FRAC, overridden by the hot runtime.json `idx_split` (runtime_conf.py) when set."""
+    v = runtime_overrides().get("idx_split")
+    return FRAC if v is None else float(v)
+
+
+def _min_work() -> float:
+    v = runtime_overrides().get("idx_split_min_work")
+    return MIN_WORK if v is None else float(v)
+
+
 def n_remote_of(seqlen: int, frac: float = None, cap: int = None) -> int:
     """How many of a call's queries go to the remote card (the LAST ones), at most the capacity."""
-    f = FRAC if frac is None else frac
+    f = _frac() if frac is None else frac
     return max(0, min(seqlen, int(round(f * seqlen)), RQMAX if cap is None else cap))
 
 
@@ -133,13 +145,13 @@ def _workspace(dev0: torch.device):
         return None
     _state["ws"] = ws
     logger.info("indexer split on: %.2f of each call's queries on %s (workspace %.1f MiB fixed, %.0f MiB free "
-                "after; slice %d, remote capacity %d, min work %.3g, min blocks %d, max blocks %d)", FRAC, dev1,
-                ws.nbytes / 2**20, free / 2**20, RSLICE, RQMAX, MIN_WORK, MIN_BLOCKS, ws.tmax)
+                "after; slice %d, remote capacity %d, min work %.3g, min blocks %d, max blocks %d)", _frac(), dev1,
+                ws.nbytes / 2**20, free / 2**20, RSLICE, RQMAX, _min_work(), MIN_BLOCKS, ws.tmax)
     return ws
 
 
 def wanted(n_blocks: int, seqlen: int) -> bool:
-    return (FRAC > 0 and n_blocks >= max(MIN_BLOCKS, TOPK_W) and seqlen * n_blocks >= MIN_WORK
+    return (_frac() > 0 and n_blocks >= max(MIN_BLOCKS, TOPK_W) and seqlen * n_blocks >= _min_work()
             and n_remote_of(seqlen) > 0)
 
 

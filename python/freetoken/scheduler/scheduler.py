@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from freetoken.runtime_conf import runtime_overrides
 import dataclasses
 import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
@@ -61,6 +62,17 @@ _RESERVE_TOKENS = int(os.environ.get("FREETOKEN_SCHED_RESERVE_TOKENS", "16384"))
 _DECODE_SHARE = min(max(float(os.environ.get("FREETOKEN_SCHED_DECODE_SHARE", "0.5")), 0.0), 0.95)
 
 
+def _decode_share() -> float:
+    """_DECODE_SHARE, overridden by the hot runtime.json `sched_decode_share` when set."""
+    v = runtime_overrides().get("sched_decode_share")
+    return _DECODE_SHARE if v is None else float(v)
+
+
+def _reserve_tokens() -> int:
+    v = runtime_overrides().get("sched_reserve_tokens")
+    return _RESERVE_TOKENS if v is None else v
+
+
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
@@ -77,6 +89,13 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    @property
+    def prefill_budget(self) -> int:
+        """Prefill chunk tokens: the boot budget, lowered by the hot `prefill_chunk_tokens`
+        (runtime_conf.py) when set."""
+        hot = runtime_overrides().get("prefill_chunk_tokens")
+        return self._prefill_budget_boot if hot is None else min(self._prefill_budget_boot, hot)
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -169,7 +188,7 @@ class Scheduler(SchedulerIOMixin):
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
         _chunk_cap = self.cache_manager.prefill_chunk_budget
-        self.prefill_budget = (
+        self._prefill_budget_boot = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
@@ -281,7 +300,7 @@ class Scheduler(SchedulerIOMixin):
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
         # the stale budget and crashes _alloc_window.
         _chunk_cap = self.cache_manager.prefill_chunk_budget
-        self.prefill_budget = (
+        self._prefill_budget_boot = (
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
@@ -1079,7 +1098,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         decode_first = (
-            _DECODE_SHARE > 0
+            _decode_share() > 0
             and (getattr(self, "_decode_due", False) or getattr(self, "_decode_credit", 0.0) > 0)
             and self.decode_manager.runnable
             and self.prefill_manager.runnable
@@ -1095,7 +1114,7 @@ class Scheduler(SchedulerIOMixin):
             return None
         batch.ts_decode_first = decode_first and batch.is_decode
         if batch.is_prefill:
-            self._decode_due = self.decode_manager.runnable and _DECODE_SHARE > 0
+            self._decode_due = self.decode_manager.runnable and _decode_share() > 0
         elif decode_first:
             self._decode_due = False
         forward_input = self._prepare_batch(batch)
@@ -1104,13 +1123,14 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_prefill(self) -> Batch | None:
         self._make_room_for_continuation()
+        self.decode_manager.reserve_cap = self.prefill_manager.reserve_cap = _reserve_tokens()
         batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         if getattr(self.prefill_manager, "rejected", None):
             self._reply_prefill_rejections()
         return batch
 
     def _account_time_share(self, batch: Batch) -> None:
-        """Drain-time bookkeeping of _DECODE_SHARE: prefill chunks earn decode credit while
+        """Drain-time bookkeeping of the decode share: prefill chunks earn decode credit while
         decodes wait, decode steps run for credit spend it. A batch's time is its span on the
         engine stream (CUDA events around _forward) -- host clocks around the launch miss it,
         since the EP prefill launch itself blocks on the device for most of the chunk."""
@@ -1123,7 +1143,8 @@ class Scheduler(SchedulerIOMixin):
         ev[1].synchronize()  # just past this batch's copy_done
         dt = ev[0].elapsed_time(ev[1]) / 1000.0
         if batch.is_prefill:
-            self._decode_credit += dt * _DECODE_SHARE / (1.0 - _DECODE_SHARE)
+            _share = _decode_share()
+            self._decode_credit += dt * _share / (1.0 - _share)
         elif getattr(batch, "ts_decode_first", False):
             self._decode_credit = max(self._decode_credit - dt, -1.0)
 
@@ -1256,7 +1277,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
-        if _DECODE_SHARE > 0:  # time-share accounting (_account_time_share)
+        if _decode_share() > 0:  # time-share accounting (_account_time_share)
             ev0 = torch.cuda.Event(enable_timing=True)
             ev0.record()
         batch.input_ids = self.token_pool[input_mapping]
@@ -1264,7 +1285,7 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        if _DECODE_SHARE > 0:
+        if _decode_share() > 0:
             ev1 = torch.cuda.Event(enable_timing=True)
             ev1.record()
             batch.ts_events = (ev0, ev1)

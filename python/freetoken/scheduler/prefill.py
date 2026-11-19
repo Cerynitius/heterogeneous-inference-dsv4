@@ -53,6 +53,13 @@ _ALIGNED_CHUNKS = os.environ.get("FREETOKEN_SCHED_ALIGNED_CHUNKS", "1") != "0"
 # reserved), so a short request no longer waits for someone else's whole long prefill.
 _SHORT_FIRST = os.environ.get("FREETOKEN_SCHED_SHORT_FIRST", "1") != "0"
 
+
+def _hot(key: str, boot):
+    """Boot value, overridden by the hot runtime.json key (runtime_conf.py) when set."""
+    from freetoken.runtime_conf import runtime_overrides
+    v = runtime_overrides().get(key)
+    return boot if v is None else v
+
 from .utils import PendingReq
 
 if TYPE_CHECKING:
@@ -279,7 +286,7 @@ class PrefillAdder:
             # reserved below, after the multimodal gate (which must not mutate the pass)
             swa_charge = (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
         is_chunked = chunk_size < remain_len
-        if _ALIGNED_CHUNKS and self.token_budget < min(self.full_budget, remain_len):
+        if _hot("sched_aligned_chunks", _ALIGNED_CHUNKS) and self.token_budget < min(self.full_budget, remain_len):
             return None  # the pass's LEFTOVER budget would cut it: whole chunk next pass instead
         if pending_req.chunked_req is not None and self.defer_short_continuation:
             ps = self.cache_manager.page_size
@@ -470,7 +477,7 @@ class PrefillManager:
         order = self.pending_list
         head = order[0]
         n_short = 0
-        if (_SHORT_FIRST and head.chunked_req is not None and len(order) > 1
+        if (_hot("sched_short_first", _SHORT_FIRST) and head.chunked_req is not None and len(order) > 1
                 and head.overtaken_at != head.chunked_req.cached_len):
             def _uncached(p):
                 # a prompt whose prefix is cached only prefills its tail: judge THAT length

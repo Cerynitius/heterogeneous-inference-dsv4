@@ -37,19 +37,84 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/131.0.0.0 Safari/537.36")
 
 log = logging.getLogger("websearch")
-sx = httpx.AsyncClient(base_url=SEARXNG, timeout=httpx.Timeout(15.0), trust_env=False)
-web = httpx.AsyncClient(proxy=PROXY, timeout=httpx.Timeout(FETCH_TIMEOUT), trust_env=False,
-                        follow_redirects=False, headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-                        limits=httpx.Limits(max_connections=64, max_keepalive_connections=16))
+# ---------------------------------------------------------------- hot config
+# conf.json (WEBSEARCH_CONF) is re-read when its mtime/size changes; keys present override the
+# environment values above, a bad file is rejected (real error logged) and the last good values stay.
+CONF_FILE = os.environ.get("WEBSEARCH_CONF", os.path.join(os.path.dirname(os.path.abspath(__file__)), "conf.json"))
+_CONF_DEFAULT = {"searxng": SEARXNG, "proxy": PROXY or "", "fetch_timeout": FETCH_TIMEOUT,
+                 "text_chars": TEXT_CHARS, "tavily_key_file": TAVILY_KEY_FILE, "tavily_depth": TAVILY_DEPTH,
+                 "cache_ttl": CACHE_TTL, "hard_host_ttl": 24 * 3600.0}
+_num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+_CONF_CHECK = {
+    "searxng": lambda v: isinstance(v, str) and v.startswith("http"),
+    "proxy": lambda v: isinstance(v, str),
+    "fetch_timeout": lambda v: _num(v) and v > 0,
+    "text_chars": lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0,
+    "tavily_key_file": lambda v: isinstance(v, str),
+    "tavily_depth": lambda v: v in ("basic", "advanced"),
+    "cache_ttl": lambda v: _num(v) and v >= 0,
+    "hard_host_ttl": lambda v: _num(v) and v >= 0,
+}
+_conf = {"key": "unset", "val": dict(_CONF_DEFAULT)}
 
 
-tavily = httpx.AsyncClient(base_url="https://api.tavily.com", proxy=PROXY, timeout=httpx.Timeout(30.0, connect=10.0),
-                           trust_env=False)
+def conf() -> dict:
+    try:
+        st = os.stat(CONF_FILE)
+        key = (st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        key = None
+    if key == _conf["key"]:
+        return _conf["val"]
+    _conf["key"] = key
+    val = dict(_CONF_DEFAULT)
+    if key is not None:
+        try:
+            doc = json.load(open(CONF_FILE))
+            if not isinstance(doc, dict):
+                raise ValueError(f"top level must be an object, got {type(doc).__name__}")
+            bad = sorted(set(doc) - set(_CONF_CHECK))
+            if bad:
+                raise ValueError(f"unknown keys {bad}; allowed {sorted(_CONF_CHECK)}")
+            for k, v in doc.items():
+                if not _CONF_CHECK[k](v):
+                    raise ValueError(f"{k}={v!r}: invalid value")
+                val[k] = v
+        except Exception as e:  # noqa: BLE001
+            log.error("conf %s rejected, keeping last values: %s: %s", CONF_FILE, type(e).__name__, e)
+            return _conf["val"]
+    _conf["val"] = val
+    log.info("conf: %s", val)
+    return val
+
+
+_clients = {"key": None}
+
+
+def clients() -> dict:
+    """sx / web / tavily clients for the current searxng, proxy and fetch timeout (rebuilt on change)."""
+    c = conf()
+    key = (c["searxng"], c["proxy"], c["fetch_timeout"])
+    if key != _clients["key"]:
+        old = [v for k, v in _clients.items() if k != "key"]
+        proxy = c["proxy"] or None
+        _clients.update(
+            key=key,
+            sx=httpx.AsyncClient(base_url=c["searxng"], timeout=httpx.Timeout(15.0), trust_env=False),
+            web=httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(c["fetch_timeout"]), trust_env=False,
+                                  follow_redirects=False,
+                                  headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                                  limits=httpx.Limits(max_connections=64, max_keepalive_connections=16)),
+            tavily=httpx.AsyncClient(base_url="https://api.tavily.com", proxy=proxy,
+                                     timeout=httpx.Timeout(30.0, connect=10.0), trust_env=False))
+        for cl in old:                                 # in-flight requests on the old clients finish first
+            asyncio.get_running_loop().call_later(120, lambda cl=cl: asyncio.ensure_future(cl.aclose()))
+    return _clients
 
 
 def _tavily_key() -> str | None:
     try:
-        return open(TAVILY_KEY_FILE).read().strip() or None
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), conf()["tavily_key_file"])).read().strip() or None
     except OSError:
         return None
 
@@ -136,12 +201,12 @@ _db.execute("CREATE TABLE IF NOT EXISTS cache (k TEXT PRIMARY KEY, t REAL, v TEX
 
 def cache_get(k: str):
     row = _db.execute("SELECT t, v FROM cache WHERE k = ?", (k,)).fetchone()
-    return json.loads(row[1]) if row and time.time() - row[0] < CACHE_TTL else None
+    return json.loads(row[1]) if row and time.time() - row[0] < conf()["cache_ttl"] else None
 
 
 def cache_put(k: str, v) -> None:
     _db.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", (k, time.time(), json.dumps(v, ensure_ascii=False)))
-    _db.execute("DELETE FROM cache WHERE t < ?", (time.time() - CACHE_TTL,))
+    _db.execute("DELETE FROM cache WHERE t < ?", (time.time() - conf()["cache_ttl"],))
     _db.commit()
 
 
@@ -174,7 +239,7 @@ async def fetch_page(url: str) -> dict:
         if err:
             return {"url": url, "error": err}
         try:
-            async with web.stream("GET", url) as r:
+            async with clients()["web"].stream("GET", url) as r:
                 if r.is_redirect:
                     url = str(r.url.join(r.headers.get("location", "")))
                     continue
@@ -215,13 +280,13 @@ async def tavily_search(q: str, n: int, site: list[str], exclude: list[str]) -> 
     key = _tavily_key()
     if not key:
         raise RuntimeError("no Tavily key")
-    body = {"query": q, "max_results": n, "search_depth": TAVILY_DEPTH, "include_raw_content": "markdown",
+    body = {"query": q, "max_results": n, "search_depth": conf()["tavily_depth"], "include_raw_content": "markdown",
             "include_answer": False}
     if site:
         body["include_domains"] = site
     if exclude:
         body["exclude_domains"] = exclude
-    r = await tavily.post("/search", json=body, headers={"Authorization": f"Bearer {key}"})
+    r = await clients()["tavily"].post("/search", json=body, headers={"Authorization": f"Bearer {key}"})
     if r.status_code != 200:
         raise RuntimeError(f"Tavily HTTP {r.status_code}: {r.text[:200]}")
     return [{"title": (x.get("title") or "").strip(), "url": x["url"], "published": x.get("published_date"),
@@ -243,7 +308,7 @@ async def tavily_extract(urls: list[str]) -> dict[str, str]:
     if not key or not urls:
         return {}
     try:
-        r = await tavily.post("/extract", json={"urls": urls, "format": "markdown"},
+        r = await clients()["tavily"].post("/extract", json={"urls": urls, "format": "markdown"},
                               headers={"Authorization": f"Bearer {key}"})
         if r.status_code != 200:
             log.warning("tavily extract HTTP %d: %s", r.status_code, r.text[:200])
@@ -259,7 +324,7 @@ async def tavily_extract(urls: list[str]) -> dict[str, str]:
 
 async def searxng_search(q: str, n: int, lang: str, site: list[str], exclude: list[str]) -> list[dict]:
     sq = q + (" " + " OR ".join(f"site:{d}" for d in site) if site else "")
-    r = await sx.get("/search", params={"q": sq, "format": "json", "language": lang, "safesearch": 0})
+    r = await clients()["sx"].get("/search", params={"q": sq, "format": "json", "language": lang, "safesearch": 0})
     r.raise_for_status()
     data = r.json()
     seen, out = set(), []
@@ -314,7 +379,7 @@ async def search(request: Request):
     # page text: Tavily's raw content, else our own fetch, else Tavily extract (first `nfetch` results)
     need = [x for x in results[:nfetch] if len(x["raw"]) < 200]
     now = time.time()
-    failed = [x for x in need if now - _hard_hosts.get(_host(x["url"]), 0) < HARD_HOST_TTL]   # known to block us
+    failed = [x for x in need if now - _hard_hosts.get(_host(x["url"]), 0) < conf()["hard_host_ttl"]]   # known to block us
     own = [x for x in need if x not in failed]
     pages = await asyncio.gather(*(fetch_page(x["url"]) for x in own))
     for x, p in zip(own, pages):
@@ -333,7 +398,7 @@ async def search(request: Request):
     for x in results:
         raw = x.pop("raw")
         lead = x["snippet"] if x["src"] == "tavily" else ""     # Tavily's snippet = its query-relevant chunks
-        rest = best_passages(q, raw, max(0, TEXT_CHARS - len(lead) - 2)) if raw else ""
+        rest = best_passages(q, raw, max(0, conf()["text_chars"] - len(lead) - 2)) if raw else ""
         x["text"] = (lead + "\n\n" + rest).strip() if rest and rest[:80] not in lead else (lead or rest or x["snippet"])
         x.pop("src")
     got = sum(1 for x in results if len(x["text"]) >= 500)

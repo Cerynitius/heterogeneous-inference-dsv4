@@ -372,6 +372,12 @@ def default_placement(L: int, E: int, n1: int) -> torch.Tensor:
     return owner
 
 
+
+def _rt() -> dict:
+    """Hot runtime.json overrides (runtime_conf.py)."""
+    from freetoken.runtime_conf import runtime_overrides
+    return runtime_overrides()
+
 class DSV4ExpertParallel:
     """Resident two-device expert banks + per-layer route split for DeepSeek-V4."""
 
@@ -678,10 +684,10 @@ class DSV4ExpertParallel:
         grouped = _PREFILL_ALWAYS_GROUPED or Tc * K >= _GROUPED_MIN_ROUTES
         main = torch.cuda.current_stream(self.dev0)
         b0, b1 = self.banks0[li], self.banks1[li]
-        nsplit = max(1, int(os.environ.get("FREETOKEN_DSV4_EP_PREFILL_SPLIT", "4")))
+        nsplit = max(1, int(_rt().get("ep_prefill_split") or os.environ.get("FREETOKEN_DSV4_EP_PREFILL_SPLIT", "4")))
         # sub-chunk sizes shrink geometrically (ratio r): each copy-back hides under the next
         # (smaller) sub-chunk's compute and the exposed last copy is short
-        ratio = float(os.environ.get("FREETOKEN_DSV4_EP_PREFILL_SPLIT_RATIO", "0.5"))
+        ratio = float(_rt().get("ep_prefill_split_ratio") or os.environ.get("FREETOKEN_DSV4_EP_PREFILL_SPLIT_RATIO", "0.5"))
         fp8_xfer = os.environ.get("FREETOKEN_DSV4_EP_FP8_XFER", "1") != "0"
         mma = grouped and _PREFILL_MMA
         if not hasattr(self, "s1c"):

@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 UPSTREAM = os.environ.get("REQFILTER_UPSTREAM", "http://127.0.0.1:1920")
+FALLBACK = os.environ.get("REQFILTER_FALLBACK", "")   # second upstream when the first refuses; "" = none
 LISTEN_PORT = int(os.environ.get("REQFILTER_PORT", "1922"))
 ALLOW = [
     ("GET", re.compile(r"/health")),
@@ -40,7 +41,10 @@ HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding"
        "proxy-connection", "proxy-authorization"}
 log = logging.getLogger("reqfilter")
 RULES_FILE = os.environ.get("REQFILTER_RULES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.json"))
-RULES_DEFAULT = {"nonstream_min_chars": 1000, "disconnect_grace_s": 15, "web_search": 1, "web_search_max_uses": 8}
+RULES_DEFAULT = {"nonstream_min_chars": 1000, "disconnect_grace_s": 15, "web_search": 1, "web_search_max_uses": 8,
+                 "web_search_results": 8, "web_search_fetch": 5,
+                 "upstream": UPSTREAM, "fallback": FALLBACK, "websearch_url": servertools.WEBSEARCH_URL}
+RULES_URLS = ("upstream", "fallback", "websearch_url")   # strings; "fallback" may be "" (none)
 _rules = {"key": None, "val": dict(RULES_DEFAULT)}
 GEN_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses")
 PROMPT_FIELDS = ("messages", "prompt", "input", "system", "instructions", "tools")
@@ -60,15 +64,23 @@ def rules() -> dict:
         if key is not None:
             try:
                 doc = json.load(open(RULES_FILE))
+                bad = sorted(set(doc) - set(RULES_DEFAULT))
+                if bad:
+                    raise ValueError(f"unknown keys {bad}; allowed {sorted(RULES_DEFAULT)}")
                 for k in RULES_DEFAULT:
                     n = doc.get(k, val[k])
-                    if not isinstance(n, (int, float)) or isinstance(n, bool) or n < 0:
+                    if k in RULES_URLS:
+                        if not isinstance(n, str) or not (n.startswith("http") or (k == "fallback" and n == "")):
+                            raise ValueError(f"{k} must be an http(s) URL{' or empty' if k == 'fallback' else ''}, got {n!r}")
+                    elif not isinstance(n, (int, float)) or isinstance(n, bool) or n < 0:
                         raise ValueError(f"{k} must be a number >= 0, got {n!r}")
                     val[k] = n
             except Exception as e:  # noqa: BLE001
                 log.error("rules.json rejected, keeping last values: %s: %s", type(e).__name__, e)
                 return _rules["val"]
         _rules["val"] = val
+        servertools.settings.update(websearch_url=val["websearch_url"], n=int(val["web_search_results"]),
+                                    fetch=int(val["web_search_fetch"]))
         log.info("rules: %s", val)
     return _rules["val"]
 
@@ -88,8 +100,17 @@ def prompt_chars(doc: dict, fields=PROMPT_FIELDS) -> int:
 
 
 INPUT_FIELDS = ("messages", "prompt", "input", "system", "instructions")   # tool schemas are not input
-client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
-                           limits=httpx.Limits(max_connections=64, max_keepalive_connections=16))
+_upstreams: dict[str, httpx.AsyncClient] = {}
+
+
+def upstream_client(url: str) -> httpx.AsyncClient:
+    """One pooled client per upstream URL (rules.json `upstream` / `fallback`, hot)."""
+    c = _upstreams.get(url)
+    if c is None:
+        c = _upstreams[url] = httpx.AsyncClient(base_url=url, timeout=httpx.Timeout(None, connect=10.0),
+                                                trust_env=False,
+                                                limits=httpx.Limits(max_connections=64, max_keepalive_connections=16))
+    return c
 
 
 def deny(request: Request, status: int, why: str):
@@ -271,15 +292,18 @@ async def _wait_disconnect(request: Request) -> None:
 
 
 async def _send(method, path, params, headers, body):
-    req = client.build_request(method, path, params=params, headers=headers, content=body or None)
+    r = rules()
+    up = upstream_client(r["upstream"])
+    req = up.build_request(method, path, params=params, headers=headers, content=body or None)
     try:
-        return await client.send(req, stream=True)
+        return await up.send(req, stream=True)
     except httpx.ConnectError as e:
-        if fallback is None:
+        if not r["fallback"]:
             raise
-        log.error("upstream %s unreachable (%s: %s), using %s", UPSTREAM, type(e).__name__, e, FALLBACK)
-        req = fallback.build_request(method, path, params=params, headers=headers, content=body or None)
-        return await fallback.send(req, stream=True)
+        log.error("upstream %s unreachable (%s: %s), using %s", r["upstream"], type(e).__name__, e, r["fallback"])
+        fb = upstream_client(r["fallback"])
+        req = fb.build_request(method, path, params=params, headers=headers, content=body or None)
+        return await fb.send(req, stream=True)
 
 
 async def relay(up: httpx.Response, disc: asyncio.Task, path: str):
@@ -328,11 +352,6 @@ async def _close_later(up: httpx.Response, nxt, path: str) -> None:
     await up.aclose()
     log.info("upstream on %s closed", path)
 
-# Optional second upstream, used when REQFILTER_UPSTREAM refuses the connection (e.g. a proxy in front
-# of the engine is down). Empty = no fallback.
-FALLBACK = os.environ.get("REQFILTER_FALLBACK", "")
-fallback = httpx.AsyncClient(base_url=FALLBACK, timeout=httpx.Timeout(None, connect=10.0), trust_env=False,
-                             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16)) if FALLBACK else None
 app = Starlette(routes=[Route("/{p:path}", handle, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])])
 
 if __name__ == "__main__":

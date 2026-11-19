@@ -23,6 +23,13 @@ def _swa_eviction_interval() -> int:
 
 _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 
+
+def _swa_interval_now() -> int:
+    """_SWA_EVICTION_INTERVAL, overridden by the hot runtime.json `swa_eviction_interval`."""
+    from freetoken.runtime_conf import runtime_overrides
+    v = runtime_overrides().get("swa_eviction_interval")
+    return _SWA_EVICTION_INTERVAL if v is None else v
+
 # Finish-time retention keeps [P - window - gap, P) swa-live for the next turn's cut near the
 # prompt end. The gap covers templates whose generation prompt injects tokens that vanish when
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
@@ -382,7 +389,7 @@ class CacheManager:
         (reused) prefix so it only frees its OWN slots, never the tree-shared prefix's swa; and keep
         a ``window + page_size`` margin so the freed slots are out-of-window for every in-flight
         forward."""
-        if not self.swa_paged or forward_iter % _SWA_EVICTION_INTERVAL != 0:
+        if not self.swa_paged or forward_iter % _swa_interval_now() != 0:
             return
         window = self.sliding_window_size
         for req in reqs:

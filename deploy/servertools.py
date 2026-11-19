@@ -36,7 +36,18 @@ SCHEMA = {"type": "object", "properties": {"query": {"type": "string", "descript
 MAX_QUERY_CHARS = 400
 KEEPALIVE_S = 5.0
 
-ws_client = httpx.AsyncClient(base_url=WEBSEARCH_URL, timeout=httpx.Timeout(40.0, connect=5.0), trust_env=False)
+# Set by reqfilter's rules() from rules.json (websearch_url, web_search_results, web_search_fetch).
+settings = {"websearch_url": WEBSEARCH_URL, "n": 8, "fetch": 5}
+_ws_clients: dict = {}
+
+
+def _ws_client() -> httpx.AsyncClient:
+    url = settings["websearch_url"]
+    c = _ws_clients.get(url)
+    if c is None:
+        c = _ws_clients[url] = httpx.AsyncClient(base_url=url, timeout=httpx.Timeout(40.0, connect=5.0),
+                                                 trust_env=False)
+    return c
 
 Post = Callable[[str, bytes], Awaitable[httpx.Response]]
 
@@ -55,14 +66,14 @@ async def run_search(query: str, site: list[str] | None = None, exclude: list[st
         raise SearchError("invalid_tool_input", "empty query")
     if len(query) > MAX_QUERY_CHARS:
         raise SearchError("query_too_long")
-    params = {"q": query, "n": 8, "fetch": 5}
+    params = {"q": query, "n": settings["n"], "fetch": min(settings["fetch"], settings["n"])}
     if site:
         params["site"] = ",".join(site)
     if exclude:
         params["exclude"] = ",".join(exclude)
     t0 = time.monotonic()
     try:
-        r = await ws_client.get("/search", params=params)
+        r = await _ws_client().get("/search", params=params)
     except Exception as e:  # noqa: BLE001
         log.error("web_search %r: backend unreachable: %s: %s", query, type(e).__name__, e)
         raise SearchError("unavailable", f"{type(e).__name__}: {e}")

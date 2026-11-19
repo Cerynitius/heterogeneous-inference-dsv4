@@ -1,1 +1,11 @@
-{"nonstream_min_chars": 1000, "disconnect_grace_s": 15, "web_search": 1, "web_search_max_uses": 8}
+{
+  "nonstream_min_chars": 1000,
+  "disconnect_grace_s": 15,
+  "web_search": 1,
+  "web_search_max_uses": 8,
+  "web_search_results": 8,
+  "web_search_fetch": 5,
+  "upstream": "http://127.0.0.1:1920",
+  "fallback": "",
+  "websearch_url": "http://127.0.0.1:1930"
+}
