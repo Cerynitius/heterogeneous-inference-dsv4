@@ -180,6 +180,7 @@ class PrefillAdder:
                 self.cache_manager.l2 = None
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
+
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -383,6 +384,8 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
+        chunked = getattr(pending_req, "chunked_req", None)
+        req.prefix_hit_len = chunked.prefix_hit_len if chunked is not None else cached_len
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         # pending (uncommitted) track snapshot of the prior chunk; None on a fresh admit
         req.mamba_last_track_seqlen = last_track_seqlen

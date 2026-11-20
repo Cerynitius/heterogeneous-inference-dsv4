@@ -7,6 +7,8 @@ stops matching at that turn. Instead:
 
 1. Cut: the new request extends a generation that did not end on its own (still running, or ended
    by a client disconnect) with that partial answer -> the old generation is aborted at once.
+   Identical histories from different clients: a running generation is cut only when it is the
+   one generation the partial answer matches; one that already ended is preferred.
 2. EOS + continue: the partial answer is rendered exactly as the model produced it --
    ``<think>`` + its reasoning + ``</think>`` + the content the client saw + EOS -- followed by
    the new messages. The old prompt is then a strict prefix of the new one (cache hit) and the
@@ -34,8 +36,9 @@ logger = init_logger(__name__)
 
 STEER_KEY = "_steer_reasoning"   # message key read by the DSV4 renderer (tokenizer/tokenize.py)
 THINK_END = "</think>"
-_KEEP = 64                       # generations remembered
-_TTL_S = 1800.0                  # ... for at most this long
+_KEEP = 64                       # ended generations remembered (running ones are never dropped)
+_TTL_S = 1800.0                  # ... for at most this long after they ended
+_RUN_TTL_S = 4 * 3600.0          # a "running" entry this old lost its finish message: drop it
 
 
 @dataclass
@@ -47,9 +50,10 @@ class _Gen:
     text: list = field(default_factory=list)   # raw output pieces (reasoning </think> content)
     finished: bool = False                     # the scheduler finished it (any reason)
     cut: bool = False                          # aborted (client disconnect, or cut by a steer)
+    t_end: float = 0.0                         # when it finished or was cut
 
 
-_SPECIAL = re.compile(r"<｜[^｜<>]{1,64}｜>")   # special tokens: the API strips them from what clients see
+_SPECIAL = re.compile(r"<｜[^｜<>]{1,64}｜>|</?think>")   # special tokens + think tags: the API strips them from what clients see
 
 
 def _cut(raw: str, client: str) -> str | None:
@@ -95,10 +99,21 @@ class SteerRegistry:
 
     # ---- bookkeeping (FrontendManager) ----
     def record(self, uid: int, messages: list, fp: str) -> None:
-        self._gens[uid] = _Gen(uid, messages, fp, time.monotonic())
         now = time.monotonic()
-        while self._gens and (len(self._gens) > _KEEP or now - next(iter(self._gens.values())).t0 > _TTL_S):
-            self._gens.popitem(last=False)
+        self._gens[uid] = _Gen(uid, messages, fp, now)
+        # Drop only generations that ended: a long running one must still be found when its
+        # client steers, however many short requests passed meanwhile (11-21: a FIFO cap of 64
+        # evicted streams that ran a few seconds under 4-way load).
+        ended = [g for g in self._gens.values() if g.finished or g.cut]
+        drop = {g.uid for g in ended if now - g.t_end > _TTL_S}
+        over = len(self._gens) - len(drop) - _KEEP
+        if over > 0:
+            drop.update(g.uid for g in sorted((g for g in ended if g.uid not in drop),
+                                              key=lambda g: g.t_end)[:over])
+        drop.update(g.uid for g in self._gens.values()
+                    if not (g.finished or g.cut) and now - g.t0 > _RUN_TTL_S)
+        for k in drop:
+            del self._gens[k]
 
     def observe(self, msg: Any) -> None:
         g = self._gens.get(getattr(msg, "uid", None))
@@ -109,11 +124,13 @@ class SteerRegistry:
             g.text.append(piece)
         if getattr(msg, "finished", False):
             g.finished = True
+            g.t_end = g.t_end or time.monotonic()
 
     def mark_cut(self, uid: int) -> None:
         g = self._gens.get(uid)
         if g is not None:
             g.cut = True
+            g.t_end = g.t_end or time.monotonic()
 
     # ---- the steer decision (submit_generation) ----
     def prepare(self, spec: Any, thinking: bool) -> tuple[list | None, int | None]:
@@ -122,34 +139,71 @@ class SteerRegistry:
             return None, None
         msgs = spec.messages
         fp = fingerprint(spec)
-        g = None
+        # Every remembered generation this request extends. Several can match when different
+        # clients sent the same history (same system prompt + "hi"): the partial answer picks the
+        # ones whose text it is, and a still-running generation is cut only when it is the single
+        # such match -- never another client's stream on a guess.
+        ok, why, ordinary = [], None, False
         for cand in reversed(self._gens.values()):
             n = len(cand.messages)
             if cand.fp != fp or n + 2 > len(msgs):
                 continue
+            if msgs[:n] != cand.messages:
+                continue
+            res = self._continue(cand, msgs)
             if cand.finished and not cand.cut:
-                continue          # ended on its own: an ordinary next turn, template rules apply
-            if msgs[:n] == cand.messages:
-                g = cand
-                break
-        if g is None:
+                # Ended on its own. The client saw all of it -> an ordinary next turn (template
+                # rules apply). Only part of it -> the client cut it on its side and the engine
+                # finished before it noticed the disconnect (polled every 0.5 s): a steer.
+                if isinstance(res, str) or res[1]:
+                    ordinary = True
+                    continue
+            if isinstance(res, str):
+                why = why or (cand.uid, res)
+            else:
+                ok.append((cand, res[0]))
+        if not ok:
+            if ordinary:
+                return None, None
+            if why is not None:
+                logger.info("steer fallback (extends uid %d): %s", *why)
             return None, None
+        ended = [x for x in ok if x[0].finished or x[0].cut]
+        running = [x for x in ok if not (x[0].finished or x[0].cut)]
+        if ended:
+            g, out = ended[0]
+            cut_uid, how = None, "already ended"
+        elif len(running) == 1:
+            g, out = running[0]
+            cut_uid, how = g.uid, "cut now"
+        else:
+            g, out = running[0]
+            cut_uid, how = None, f"{len(running)} identical running generations, none cut"
+        if cut_uid is not None:
+            g.cut = True
+            g.t_end = g.t_end or time.monotonic()
+        newpart = out[len(g.messages)]
+        logger.info(
+            "steer: continues uid %d (%s), keeps %d reasoning + %d content chars, then %d new message(s)",
+            g.uid, how, len(newpart[STEER_KEY]), len(newpart["content"]), len(out) - len(g.messages) - 1,
+        )
+        return out, cut_uid
+
+    @staticmethod
+    def _continue(g: _Gen, msgs: list) -> "tuple[list, bool] | str":
+        """(the steer rendering of ``msgs`` as a continuation of ``g``, whether the client's partial
+        answer is ALL of g's visible output), or why it is not a continuation."""
         n = len(g.messages)
         part, rest = msgs[n], msgs[n + 1:]
-
-        def no(why: str):
-            logger.info("steer fallback (extends uid %d): %s", g.uid, why)
-            return None, None
-
         if part.get("role") != "assistant":
-            return no("no partial answer after the cut turn")
+            return "no partial answer after the cut turn"
         if not any(m.get("role") == "user" for m in rest):
-            return no("no new user message")
+            return "no new user message"
         if part.get("tool_calls"):
-            return no("partial answer carries tool calls")
+            return "partial answer carries tool calls"
         content = part.get("content") or ""
         if not isinstance(content, str):
-            return no("partial answer content is not plain text")
+            return "partial answer content is not plain text"
         raw = "".join(g.text)
         if THINK_END in raw:
             reasoning, body = raw.split(THINK_END, 1)
@@ -159,7 +213,7 @@ class SteerRegistry:
         if c_cli:
             body_keep = _cut(body, c_cli) if THINK_END in raw else None
             if body_keep is None:
-                return no("partial content is not what the model wrote" + _diff(body.lstrip(), c_cli))
+                return "partial content is not what the model wrote" + _diff(body.lstrip(), c_cli)
             reasoning_keep = reasoning                 # reasoning was complete
         else:
             body_keep = ""
@@ -167,19 +221,14 @@ class SteerRegistry:
             if r_cli:
                 reasoning_keep = _cut(reasoning, r_cli)
                 if reasoning_keep is None:
-                    return no("partial reasoning is not what the model wrote" + _diff(reasoning.lstrip(), r_cli))
+                    return "partial reasoning is not what the model wrote" + _diff(reasoning.lstrip(), r_cli)
             else:
                 reasoning_keep = reasoning             # everything generated before the cut
         if not reasoning_keep.strip() and not body_keep:
-            return no("nothing was generated before the cut")
+            return "nothing was generated before the cut"
         newpart = dict(part)
         newpart["content"] = body_keep
         newpart[STEER_KEY] = reasoning_keep
-        cut_uid = None if g.finished else g.uid
-        g.cut = True
-        logger.info(
-            "steer: continues uid %d (%s), keeps %d reasoning + %d content chars, then %d new message(s)",
-            g.uid, "cut now" if cut_uid is not None else "already ended", len(reasoning_keep),
-            len(body_keep), len(rest),
-        )
-        return msgs[:n] + [newpart] + list(rest), cut_uid
+        vis = lambda t: _SPECIAL.sub("", t).strip()  # noqa: E731
+        complete = vis(reasoning_keep) == vis(reasoning) and vis(body_keep) == vis(body)
+        return msgs[:n] + [newpart] + list(rest), complete

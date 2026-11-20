@@ -1103,12 +1103,20 @@ class Scheduler(SchedulerIOMixin):
             and self.decode_manager.runnable
             and self.prefill_manager.runnable
         )
-        batch = None if decode_first else self._schedule_prefill()
+        # A request aborted while its forward is in flight is freed -- and its generated tokens
+        # committed to the prefix cache -- only by this iteration's _process_last_data, which runs
+        # AFTER this scheduling. A steer (server/steer.py: abort + a new request that extends the
+        # aborted one) usually lands in the same receive batch, so admitting prefill now would
+        # match only the old prompt and recompute everything the aborted request generated. Hold
+        # prefill for this one iteration (decode still runs); the next one sees the committed path.
+        hold_prefill = self._last_data is not None and any(
+            getattr(r, "aborted", False) for r in self._last_data[0].batch.reqs)
+        batch = None if (decode_first or hold_prefill) else self._schedule_prefill()
         if batch is None:
             batch = self.decode_manager.schedule_next_batch()
             if batch is not None:
                 batch = self._make_room_for_decode(batch)
-            if batch is None and decode_first:
+            if batch is None and decode_first and not hold_prefill:
                 batch = self._schedule_prefill()  # decode retracted itself away
         if batch is None:
             return None

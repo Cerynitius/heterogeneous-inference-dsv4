@@ -777,7 +777,8 @@ class CacheManager:
                 )
                 if keep_from > 0:
                     self._free_swa(
-                        self.prefix_cache.trim_head_swa(self._key_ids_of(req)[:prompt_len], keep_from))
+                        self.prefix_cache.trim_head_swa(self._key_ids_of(req)[:prompt_len], keep_from,
+                                                        skip_before=req.prefix_hit_len))
                 self.prefix_cache.match_prefix(self._key_ids_of(req)[:prompt_len])
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
