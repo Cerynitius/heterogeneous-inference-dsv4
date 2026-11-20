@@ -24,6 +24,10 @@ from typing import Any
 #   max_queued_requests        int >= 0     requests allowed to wait beyond the running ones; a new
 #                                           request finding running + waiting >= max_running_requests +
 #                                           this gets 429 at once; unset = no cap
+#   steer_continue             bool         a request that steers a cut generation (history + its
+#                                           partial answer + a new user message) keeps the model's
+#                                           reasoning for that turn and reuses its cache (server/steer.py);
+#                                           unset = on
 #   prefill_chunk_tokens       int >= 1     prefill chunk size; capped at the boot chunk
 #                                           (FREETOKEN_PREFILL_CHUNK_CAP / window budget)
 #   idx_split                  float 0..1   share of deep prefill indexer queries on the
@@ -51,6 +55,7 @@ _RT_TYPES: dict[str, tuple[type, ...]] = {
     "default_thinking": (bool,),
     "max_running_requests": (int,),
     "max_queued_requests": (int,),
+    "steer_continue": (bool,),
     "prefill_chunk_tokens": (int,),
     "idx_split": (int, float),
     "idx_split_min_work": (int, float),

@@ -201,6 +201,9 @@ class FrontendManager:
     def __post_init__(self) -> None:
         if self.stats is None:
             self.stats = StatsTracker()
+        from .steer import SteerRegistry
+
+        self.steer = SteerRegistry()  # steer: cut + EOS + continue (server/steer.py)
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -272,6 +275,7 @@ class FrontendManager:
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
                 self.stats.observe(msg)
+                self.steer.observe(msg)
                 if msg.uid not in self.ack_map:
                     continue
                 self.ack_map[msg.uid].append(msg)
@@ -462,6 +466,7 @@ class FrontendManager:
         event = self.event_map.pop(uid, None)
         self.ack_map.pop(uid, None)
         self.stats.on_abort(uid)
+        self.steer.mark_cut(uid)
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
         if event is not None:

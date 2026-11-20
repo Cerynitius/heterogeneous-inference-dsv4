@@ -244,6 +244,17 @@ def _apply_dsv4_chat_encoder(
     chat_template_kwargs: dict,
 ) -> str:
     rendered_messages = [dict(message) for message in messages]
+    # Steer (server/steer.py): a cut partial answer followed by a new user message keeps the
+    # reasoning the model produced. The encoder drops reasoning before the last user message,
+    # so render it with a placeholder content and put <think>reasoning</think>content back.
+    steer_slots = {}
+    for i, message in enumerate(rendered_messages):
+        if "_steer_reasoning" in message:
+            slot = f"\ue000steer{i}\ue001"
+            reasoning = message.pop("_steer_reasoning") or ""
+            steer_slots[slot] = (reasoning, message.get("content") or "")
+            message["content"] = slot
+            message["reasoning_content"] = reasoning
     for message in rendered_messages:
         if message.get("tool_calls"):
             message["tool_calls"] = _dsv4_tool_calls(message["tool_calls"])
@@ -252,11 +263,26 @@ def _apply_dsv4_chat_encoder(
 
     # No effort filtering here: the caller sanitized already, and the probe
     # needs raw values to reach the encoder's own validation.
-    return encoder.encode_messages(
+    text = encoder.encode_messages(
         rendered_messages,
         thinking_mode=resolve_thinking_mode(chat_template_kwargs, tools),
         reasoning_effort=_dsv4_effort(encoder, chat_template_kwargs.get("reasoning_effort")),
     )
+    t_start = getattr(encoder, "thinking_start_token", "<think>")
+    t_end = getattr(encoder, "thinking_end_token", "</think>")
+    for slot, (reasoning, content) in steer_slots.items():
+        kept, dropped = reasoning + t_end + slot, t_end + slot
+        if text.count(slot) != 1:
+            logger.error("steer render: placeholder found %d times, rendering normally", text.count(slot))
+            text = text.replace(slot, content)
+        elif text.count(kept) == 1:   # the template kept the reasoning itself (e.g. after a tool result)
+            text = text.replace(slot, content)
+        elif text.count(dropped) == 1:  # reasoning dropped before the new user message: put it back
+            text = text.replace(dropped, t_start + reasoning + t_end + content)
+        else:
+            logger.error("steer render: unexpected template shape, reasoning not kept")
+            text = text.replace(slot, content)
+    return text
 
 
 def _dsv4_effort(encoder: ModuleType, effort: Any) -> Any:

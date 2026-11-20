@@ -167,6 +167,7 @@ Edit `deploy/runtime.json`; the next request uses the new values. Sampling and t
 | `ep_prefill_split` | int ≥ 1 | MoE sub-chunks per prefill chunk across the two cards |
 | `ep_prefill_split_ratio` | 0–1 | size ratio of consecutive sub-chunks |
 | `forward_unknown_tools` | bool | pass through tool calls whose name the request did not declare |
+| `steer_continue` | bool | default on: a request that continues an interrupted answer (history + the partial answer + a new user message) aborts the old generation at once and keeps the model's reasoning for that turn |
 
 An invalid file is rejected; the engine logs the error and keeps the last valid values. Deleting the file returns to the startup defaults.
 

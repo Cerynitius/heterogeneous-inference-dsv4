@@ -301,8 +301,11 @@ def extract_images(messages: list[dict[str, Any]]) -> list[Any]:
                     preprocess_image,
                 )
 
-                img = decode_image_part(part.get("image_url") or part.get("image"))
-                pixels, grid = preprocess_image(img)
+                try:
+                    img = decode_image_part(part.get("image_url") or part.get("image"))
+                    pixels, grid = preprocess_image(img)
+                except (OSError, SyntaxError) as e:  # PIL truncated/unidentified data, URL fetch failure -> 400, not 500 (2026-11-20)
+                    raise ValueError(f"invalid image: {type(e).__name__}: {e}") from e
                 # Transport-safe payload: the ZMQ msgpack codec only carries
                 # primitives/bytes/1-D tensors -- raw fp32 bytes + a grid list ride
                 # both hops (api -> tokenizer -> scheduler) unchanged.
@@ -313,8 +316,11 @@ def extract_images(messages: list[dict[str, Any]]) -> list[Any]:
                     preprocess_video,
                 )
 
-                frames, ts = decode_video_part(part.get("video_url") or part.get("video"))
-                pixels, grid, unit_ts = preprocess_video(frames, ts)
+                try:
+                    frames, ts = decode_video_part(part.get("video_url") or part.get("video"))
+                    pixels, grid, unit_ts = preprocess_video(frames, ts)
+                except (OSError, SyntaxError) as e:  # same as images (2026-11-20)
+                    raise ValueError(f"invalid video: {type(e).__name__}: {e}") from e
                 images.append({
                     "kind": "video",
                     "pix": pixels.tobytes(),
@@ -369,11 +375,28 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     apply_thinking_default(spec)
+    from .steer import fingerprint
+
+    steer = getattr(state, "steer", None)
+    render_msgs, cut_uid = None, None
+    if steer is not None:
+        try:
+            render_msgs, cut_uid = steer.prepare(
+                spec, resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking")
+        except Exception as e:  # noqa: BLE001 -- a steer bug must never fail the request
+            from freetoken.utils import init_logger
+
+            init_logger(__name__).error("steer check failed, rendering normally: %s: %s", type(e).__name__, e)
+            render_msgs, cut_uid = None, None
+    if cut_uid is not None:
+        await state.abort_user(cut_uid)   # cut the superseded generation before the queue check
     uid = state.new_user()
+    if steer is not None:
+        steer.record(uid, spec.messages, fingerprint(spec))
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=spec.messages,
+            text=render_msgs if render_msgs is not None else spec.messages,
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
