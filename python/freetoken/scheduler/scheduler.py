@@ -1212,6 +1212,7 @@ class Scheduler(SchedulerIOMixin):
             # the GPU work is stream-ordered before any reuse of the pages.
             self._free_req_resources(req)
             pending.chunked_req = None
+            pending.resumed = True  # its prompt admission was already published: never again
             return
         self.decode_manager.remove_req(req)
         inflight = self._last_data is not None and req in self._last_data[0].batch.reqs

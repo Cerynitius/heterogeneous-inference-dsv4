@@ -40,6 +40,37 @@ def _bf16_gemv_fp32_kernel(
     tl.store(out_ptr + offs_n, acc, mask=n_mask)
 
 
+@triton.jit
+def _bf16_gemv_fp32_rows_kernel(
+    x_ptr, w_ptr, out_ptr, N, K,
+    stride_wn, stride_wk, stride_xm, stride_om,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """_bf16_gemv_fp32_kernel for row program_id(1) of a small-M decode batch: same per-row math,
+    so each row equals the M=1 result; the weight tile is shared by the rows through L2."""
+    pid = tl.program_id(0)
+    row = tl.program_id(1)
+    x_ptr += row * stride_xm
+    out_ptr += row * stride_om
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    w_row = w_ptr + offs_n[:, None] * stride_wn
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        w = tl.load(w_row + offs_k[None, :] * stride_wk,
+                    mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        xk = tl.load(x_ptr + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+        acc += tl.sum(w * xk[None, :], axis=1)
+    tl.store(out_ptr + offs_n, acc, mask=n_mask)
+
+
+# small decode batches (multi-request steps) take the row GEMV instead of F.linear(x.float(), w.float()),
+# which wrote an fp32 copy of the weight every step and ran an fp32 cuBLAS GEMM (two-request decode)
+_ROWS_MAX = 8
+
+
 def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor, row_invariant: bool = False) -> torch.Tensor:
     """``out = x @ weight.T`` in fp32, reading ``weight`` (bf16) straight from HBM.
 
@@ -58,6 +89,17 @@ def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor, row_invariant: bool 
     for d in lead:
         M *= d
     if M != 1:
+        if not row_invariant and M <= _ROWS_MAX:
+            x2 = x.reshape(M, K)
+            if x2.stride(1) != 1:
+                x2 = x2.contiguous()
+            out = torch.empty(M, N, dtype=torch.float32, device=x.device)
+            _bf16_gemv_fp32_rows_kernel[(triton.cdiv(N, 2), M)](
+                x2, weight, out, N, K,
+                weight.stride(0), weight.stride(1), x2.stride(0), out.stride(0),
+                BLOCK_N=2, BLOCK_K=min(triton.next_power_of_2(K), 4096), num_warps=4,
+            )
+            return out.reshape(*lead, N)
         if not row_invariant:
             return F.linear(x.float(), weight.float())
         from .rowinv_linear import rowinv_linear
