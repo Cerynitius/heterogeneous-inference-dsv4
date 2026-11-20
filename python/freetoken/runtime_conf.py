@@ -21,6 +21,9 @@ from typing import Any
 #   max_running_requests       int >= 1     requests admitted at once; capped at the boot
 #                                           --max-running-requests (slots are sized at boot);
 #                                           lowering it never stops running requests
+#   max_queued_requests        int >= 0     requests allowed to wait beyond the running ones; a new
+#                                           request finding running + waiting >= max_running_requests +
+#                                           this gets 429 at once; unset = no cap
 #   prefill_chunk_tokens       int >= 1     prefill chunk size; capped at the boot chunk
 #                                           (FREETOKEN_PREFILL_CHUNK_CAP / window budget)
 #   idx_split                  float 0..1   share of deep prefill indexer queries on the
@@ -47,6 +50,7 @@ _RT_TYPES: dict[str, tuple[type, ...]] = {
     "default_reasoning_effort": (str, type(None)),
     "default_thinking": (bool,),
     "max_running_requests": (int,),
+    "max_queued_requests": (int,),
     "prefill_chunk_tokens": (int,),
     "idx_split": (int, float),
     "idx_split_min_work": (int, float),
@@ -73,7 +77,8 @@ def _validate_runtime(raw: Any) -> dict[str, Any]:
             raise ValueError(f"{k}={v!r}: wrong type")
     if raw.get("default_max_output_tokens", 1) < 1:
         raise ValueError("default_max_output_tokens must be >= 1")
-    for k, lo, hi in (("max_running_requests", 1, None), ("prefill_chunk_tokens", 1, None),
+    for k, lo, hi in (("max_running_requests", 1, None), ("max_queued_requests", 0, None),
+                      ("prefill_chunk_tokens", 1, None),
                       ("idx_split", 0, 1), ("idx_split_min_work", 0, None), ("sched_decode_share", 0, 0.95),
                       ("sched_reserve_tokens", 0, None), ("swa_eviction_interval", 1, None),
                       ("ep_prefill_split", 1, None), ("ep_prefill_split_ratio", 0.01, 1)):

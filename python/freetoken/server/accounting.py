@@ -23,6 +23,11 @@ class AdmissionClosedError(RuntimeError):
     """A generation tried to enter after the prepare-stop gate was closed."""
 
 
+class QueueFullError(RuntimeError):
+    """A generation arrived while running + waiting requests already filled the hot
+    max_running_requests + max_queued_requests (runtime.json)."""
+
+
 class AccountingDrainError(RuntimeError):
     """The engine could not reach a sealed accounting state within the bounded stop barrier."""
 
@@ -135,6 +140,14 @@ def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> No
         return JSONResponse(status_code=503, content={"error": str(exc)})
 
     app.add_exception_handler(AdmissionClosedError, _admission_closed)
+
+    async def _queue_full(_: Request, exc: QueueFullError) -> JSONResponse:
+        return JSONResponse(
+            status_code=429, headers={"retry-after": "10"},
+            content={"type": "error", "error": {"type": "rate_limit_error", "code": "queue_full",
+                                                "message": str(exc)}})
+
+    app.add_exception_handler(QueueFullError, _queue_full)
 
     @app.post("/v1/admin/prepare-stop")
     async def prepare_stop(request: Request, body: PrepareStopBody | None = None):

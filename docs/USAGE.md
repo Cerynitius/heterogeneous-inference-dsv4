@@ -42,7 +42,7 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
 | `FT` | `ft` | engine CLI |
 
-Limits: 1,048,576 tokens per request (input + output); concurrent requests = `max_running_requests` in `deploy/runtime.json` (4), at most `DSV4_MAX_RUNNING`. When the running requests together need more than the KV pool (2,097,152 tokens), the newest one pauses and resumes from where it stopped.
+Limits: 1,048,576 tokens per request (input + output); concurrent requests = `max_running_requests` in `deploy/runtime.json` (4), at most `DSV4_MAX_RUNNING`; up to `max_queued_requests` (4) more wait, further requests get 429. When the running requests together need more than the KV pool (2,097,152 tokens), the newest one pauses and resumes from where it stopped.
 
 ## Request filter
 
@@ -155,6 +155,7 @@ Edit `deploy/runtime.json`; the next request uses the new values. Sampling and t
 | `top_k` | int | default top_k |
 | `force_temperature` | number / null | every request samples at this temperature |
 | `max_running_requests` | int ≥ 1 | requests run at once, at most `DSV4_MAX_RUNNING`; lowering it does not stop running requests |
+| `max_queued_requests` | int ≥ 0 | requests that may wait beyond the running ones; a request finding the queue full gets 429 `queue_full`; missing = no limit |
 | `prefill_chunk_tokens` | int ≥ 1 | prefill chunk size, at most the startup chunk (8192) |
 | `idx_split` | 0–1 | share of deep prefill indexer queries scored on GPU 1, `0` = off |
 | `idx_split_min_work` | number ≥ 0 | split only when queries × key blocks of a call reach this |

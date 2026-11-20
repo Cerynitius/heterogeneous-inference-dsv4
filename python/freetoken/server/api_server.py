@@ -37,7 +37,7 @@ from pydantic import BaseModel
 
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
-from .accounting import AdmissionClosedError, register_accounting_routes
+from .accounting import AdmissionClosedError, QueueFullError, register_accounting_routes
 from .control_api import register_control_routes
 from .generation import FORCE_TEMPERATURE
 from .openai_api import register_openai_routes
@@ -234,12 +234,32 @@ class FrontendManager:
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
             )
+        self._check_queue_limit()
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         self.stats.on_new_user(uid)
         return uid
+
+    def _check_queue_limit(self) -> None:
+        """Hot runtime.json max_queued_requests: refuse a new generation (429) when the requests
+        in flight (running + waiting) already reach max_running_requests + max_queued_requests.
+        Runs on the event loop before the request exists, so concurrent arrivals cannot race."""
+        from freetoken.runtime_conf import runtime_overrides
+
+        rt = runtime_overrides()
+        q = rt.get("max_queued_requests")
+        if q is None:
+            return
+        boot = getattr(self.config, "max_running_req", None)
+        run = rt.get("max_running_requests") or boot or 1
+        if boot:
+            run = min(run, boot)
+        if self.stats.active >= run + q:
+            raise QueueFullError(
+                f"server busy: {run} requests running and {q} waiting (limit); retry later"
+            )
 
     async def listen(self):
         while True:
