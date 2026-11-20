@@ -42,7 +42,7 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
 | `FT` | `ft` | engine CLI |
 
-Limits: 1,048,576 tokens per request (input + output); concurrent requests = `max_running_requests` in `deploy/runtime.json` (2), at most `DSV4_MAX_RUNNING`.
+Limits: 1,048,576 tokens per request (input + output); concurrent requests = `max_running_requests` in `deploy/runtime.json` (4), at most `DSV4_MAX_RUNNING`. When the running requests together need more than the KV pool (2,097,152 tokens), the newest one pauses and resumes from where it stopped.
 
 ## Request filter
 
