@@ -55,6 +55,8 @@ export FREETOKEN_PREFILL_CHUNK_CAP=8192
 
 # Host-RAM L2 prefix cache (GiB of pinned memory).
 export FREETOKEN_DSV4_L2_GB=${FREETOKEN_DSV4_L2_GB:-64}
+# Share of the L2 for window pages (one per resume point, ~17 MiB each).
+export FREETOKEN_DSV4_L2_WIN_FRAC=${FREETOKEN_DSV4_L2_WIN_FRAC:-0.3}
 
 # Request defaults; deploy/runtime.json overrides them at runtime without a restart.
 export FREETOKEN_DEFAULT_MAX_OUTPUT_TOKENS=393216

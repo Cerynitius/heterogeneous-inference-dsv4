@@ -44,6 +44,10 @@ from typing import Any
 #   ep_prefill_split_ratio     float 0..1   geometric shrink of those sub-chunks
 #   forward_unknown_tools      bool         pass through tool calls whose name the request
 #                                           did not declare
+#   l2_min_tokens              int >= 0     host L2: sessions shorter than this are not
+#                                           snapshotted (default 2048; re-prefill is cheap)
+#   l2_resume_points           int >= 1     host L2: resume points kept per snapshot, deepest
+#                                           first (default 3; each costs one window page)
 _RUNTIME_CONF = _os.getenv("FREETOKEN_RUNTIME_CONF", "").strip()
 _RT_TYPES: dict[str, tuple[type, ...]] = {
     "default_max_output_tokens": (int,),
@@ -67,6 +71,8 @@ _RT_TYPES: dict[str, tuple[type, ...]] = {
     "ep_prefill_split": (int,),
     "ep_prefill_split_ratio": (int, float),
     "forward_unknown_tools": (bool,),
+    "l2_min_tokens": (int,),
+    "l2_resume_points": (int,),
 }
 _rt_state: dict[str, Any] = {"key": None, "values": {}}
 
@@ -86,7 +92,8 @@ def _validate_runtime(raw: Any) -> dict[str, Any]:
                       ("prefill_chunk_tokens", 1, None),
                       ("idx_split", 0, 1), ("idx_split_min_work", 0, None), ("sched_decode_share", 0, 0.95),
                       ("sched_reserve_tokens", 0, None), ("swa_eviction_interval", 1, None),
-                      ("ep_prefill_split", 1, None), ("ep_prefill_split_ratio", 0.01, 1)):
+                      ("ep_prefill_split", 1, None), ("ep_prefill_split_ratio", 0.01, 1),
+                      ("l2_min_tokens", 0, None), ("l2_resume_points", 1, None)):
         if k in raw and (raw[k] < lo or (hi is not None and raw[k] > hi)):
             raise ValueError(f"{k}={raw[k]!r} out of range [{lo}, {hi if hi is not None else 'inf'}]")
     return dict(raw)

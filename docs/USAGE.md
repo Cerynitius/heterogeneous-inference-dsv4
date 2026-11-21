@@ -39,6 +39,7 @@ The server is ready when `POST /v1/chat/completions` answers.
 | `FREETOKEN_DSV4_IDX_SPLIT_MIN_WORK` | `1.1e8` | split only when queries × key blocks of a call reach this |
 | `FREETOKEN_DSV4_IDX_SPLIT_MARGIN_MB` | `768` | free MiB GPU 1 must keep after the split workspace, else the split stays off |
 | `FREETOKEN_DSV4_L2_GB` | `64` | host L2 prefix cache size, GiB |
+| `FREETOKEN_DSV4_L2_WIN_FRAC` | `0.3` | share of the L2 for window pages (one per resume point) |
 | `FREETOKEN_RUNTIME_CONF` | `deploy/runtime.json` | hot-reloadable defaults file |
 | `FT` | `ft` | engine CLI |
 
@@ -168,6 +169,8 @@ Edit `deploy/runtime.json`; the next request uses the new values. Sampling and t
 | `ep_prefill_split_ratio` | 0–1 | size ratio of consecutive sub-chunks |
 | `forward_unknown_tools` | bool | pass through tool calls whose name the request did not declare |
 | `steer_continue` | bool | default on: a request that continues an interrupted answer (history + the partial answer + a new user message) aborts the old generation at once and keeps the model's reasoning for that turn |
+| `l2_min_tokens` | int | default 2048: sessions shorter than this are not saved to the host L2 |
+| `l2_resume_points` | int | default 3: resume points kept per L2 snapshot, deepest first |
 
 An invalid file is rejected; the engine logs the error and keeps the last valid values. Deleting the file returns to the startup defaults.
 

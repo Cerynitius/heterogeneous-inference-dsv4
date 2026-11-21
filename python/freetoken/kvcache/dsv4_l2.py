@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from freetoken.runtime_conf import runtime_overrides
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -90,10 +91,17 @@ class _Entry:
     hashes: list               # prefix hash at each boundary
     checks: dict = field(default_factory=dict)
     pinned: bool = False
+    page_hashes: list = field(default_factory=list)   # prefix hash at every page end
 
 
 class DSV4HostL2:
-    def __init__(self, pool, budget_gb: float, win_fraction: float = 0.12):
+    def __init__(self, pool, budget_gb: float, win_fraction: float | None = None):
+        # Share of the budget for window pages (one per resume point, ~17 MiB each). 11-21:
+        # 0.12 gave 462 window pages next to 16.7M tokens of full pages; under agent traffic the
+        # window pages ran out at ~165 snapshots with the full pages at most 31% used, and LRU
+        # dropped 600K-860K-token sessions. Startup-only (memory layout).
+        if win_fraction is None:
+            win_fraction = float(os.environ.get("FREETOKEN_DSV4_L2_WIN_FRAC", "0.3") or 0.3)
         self.pool = pool
         self.P = int(pool.P)
         self.device = pool._device if hasattr(pool, "_device") else torch.device("cuda")
@@ -232,6 +240,11 @@ class DSV4HostL2:
         bounds = sorted({int(b) for b in bounds if 0 < b <= L and b % P == 0})
         if L == 0 or L % P or not bounds or bounds[-1] != L:
             return False
+        rt = runtime_overrides()
+        if L < rt.get("l2_min_tokens", 2048):      # cheaper to re-prefill than a window page
+            self.stats["skipped_short"] = self.stats.get("skipped_short", 0) + 1
+            return False
+        kmax = rt.get("l2_resume_points", 3)
         n_full = L // P
         tok = tokens[:L].to("cpu", torch.int64)
         hashes = self._page_hashes(tok, n_full)
@@ -240,6 +253,14 @@ class DSV4HostL2:
             # already a resume point of a longer snapshot (cascade-evicted parent of a saved leaf)
             self.entries.move_to_end(hit[0])
             return False
+        # A prefix of a longer snapshot whose resume point here was left out (l2_resume_points):
+        # its parent nodes are evicted one by one after the leaf, and saving each as its own
+        # snapshot would spend the window pages the cap saves, plus duplicate full pages.
+        for eid, e in self.entries.items():
+            if e.L > L and e.page_hashes[n_full - 1] == hashes[-1] and torch.equal(e.tokens[:L], tok):
+                self.entries.move_to_end(eid)
+                self.stats["skipped_prefix"] = self.stats.get("skipped_prefix", 0) + 1
+                return False
         # An older snapshot with a resume point on this path is an earlier state of the same
         # conversation: this one covers it. Its later resume points are a dead branch (the next
         # turn re-renders generated tokens through the chat template, so they never match).
@@ -255,12 +276,15 @@ class DSV4HostL2:
         if not bounds or bounds[-1] != L:
             return False
         wl = wl[wl >= 0]
+        if len(bounds) > kmax:                     # deepest resume points only (window pages)
+            bounds, wl = bounds[-kmax:], wl[-kmax:]
         if not self._reserve(n_full, len(bounds)):
             return False
         dev_full = torch.div(slots[::P].to(torch.int64), P, rounding_mode="floor")
         dev_win = torch.div(wl, P, rounding_mode="floor")
         e = _Entry(tok, L, [self.free_full.pop() for _ in range(n_full)], bounds,
-                   [self.free_win.pop() for _ in range(len(bounds))], [hashes[b // P - 1] for b in bounds])
+                   [self.free_win.pop() for _ in range(len(bounds))], [hashes[b // P - 1] for b in bounds],
+                   page_hashes=hashes)
         self._d2h(self.full, dev_full, e.full_pages, e.checks)
         self._d2h(self.win, dev_win, e.win_pages, e.checks)
         eid = self._next_id
@@ -270,8 +294,9 @@ class DSV4HostL2:
             self.by_end[(B, h)] = (eid, jx)
         self.stats["saved"] += 1
         self.stats["saved_tokens"] += L
-        logger.info(f"L2 save: {L} tokens ({n_full} pages, resume points {bounds[-3:]}) -> host; "
-                    f"{len(self.entries)} entries, {self.n_full - len(self.free_full)}/{self.n_full} pages used")
+        logger.info(f"L2 save: {L} tokens ({n_full} pages, {len(bounds)} resume points {bounds[-3:]}) -> host; "
+                    f"{len(self.entries)} entries, {self.n_full - len(self.free_full)}/{self.n_full} pages, "
+                    f"{self.n_win - len(self.free_win)}/{self.n_win} window pages used")
         return True
 
     # ------------------------------------------------------------------ lookup / restore
